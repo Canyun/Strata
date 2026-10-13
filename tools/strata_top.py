@@ -127,8 +127,8 @@ def engine_panel(m: dict) -> list[str]:
     return rows
 
 
-def live_panel(m: dict, show_slots: bool) -> list[str]:
-    """What the engine is doing now: the decode rate, a prompt read's progress, each batch slot."""
+def live_panel(m: dict) -> list[str]:
+    """What the engine is doing now: the decode rate and a prompt read's progress."""
     live = m.get("live", {})
     state = live.get("state")
     rows = []
@@ -146,15 +146,45 @@ def live_panel(m: dict, show_slots: bool) -> list[str]:
         rows.append(f"parallel  {live.get('running', 0)}/{live.get('parallel')} running"
                     f"   waiting {live.get('waiting', 0)}   admitting {live.get('admitting', 0)}"
                     f"   outside slots {live.get('outside_slots', 0)}")
-    if show_slots:
-        for slot in live.get("slots", []):
-            if slot.get("state") == "idle":
-                rows.append(f"  slot {slot.get('slot')}:  idle       holds {num(slot.get('held_tokens'))} tok"
-                            f" for the next turn")
-            else:
-                rows.append(f"  slot {slot.get('slot')}:  {slot.get('state')!s:<9}"
-                            f"  prompt {num(slot.get('prompt_tokens'))}   gen {num(slot.get('generated'))}"
-                            f"   {val(slot.get('tok_s'), ' tok/s')}   {val(slot.get('elapsed_s'), 's')}")
+    return rows
+
+
+def slots_panel(m: dict) -> list[str]:
+    """Every batch slot: its zone, the context it fits, what it runs and, when idle, the tokens it holds for the
+    conversation that will come back to it.  A locked slot holds a long conversation used inside the grace, so
+    eviction never takes it; an idle slot past the grace holds a dead conversation and can be taken.  `read`
+    capacity is what pick_slot routes on: a prompt wider than a slot's cap never lands in it."""
+    live = m.get("live", {})
+    slots = live.get("slots") or []
+    if not slots:
+        return []
+    zones = [s.get("zone") for s in slots if s.get("zone")]
+    head = f"slots     {len(slots)}"
+    if zones:
+        protected = sum(1 for z in zones if z == "protected")
+        head += f"  ({protected} protected / {len(zones) - protected} guest)"
+    rows = [head]
+    if slots[0].get("zone"):
+        rows.append(f"          {'':<8} {'zone':<10} {'cap':>9}  {'state':<10} {'tokens':>16}"
+                    f" {'tok/s':>8} {'idle':>8}  flags")
+    for s in slots:
+        slot_id = f"  slot {s.get('slot')}"
+        tokens = (f"gen {num(s.get('generated'))}/{num(s.get('prompt_tokens'))}"
+                  if s.get("state") != "idle" else f"holds {num(s.get('held_tokens'))}")
+        if not s.get("zone"):
+            rows.append(f"{slot_id:<10} {s.get('state')!s:<10}"
+                        f"  {tokens:>16}   {val(s.get('tok_s')):>8}   {val(s.get('elapsed_s'), 's'):>8}")
+            continue
+        flags = []
+        if s.get("locked"):
+            flags.append("LOCKED")
+        if s.get("state") == "idle" and s.get("held_tokens"):
+            flags.append("cache")
+        elif s.get("state") == "idle":
+            flags.append("free")
+        rows.append(f"{slot_id:<10} {s.get('zone')!s:<10} {num(s.get('cap')):>9}"
+                    f"  {s.get('state')!s:<10} {tokens:>16}   {val(s.get('tok_s')):>8}"
+                    f"   {dur_text(s.get('idle_s')):>8}  {','.join(flags)}")
     return rows
 
 
@@ -269,7 +299,10 @@ def history_table(m: dict, rows: int) -> list[str]:
 
 def render(m: dict, opts) -> str:
     """The /metrics dict as one top screen: the engine, what runs now, the hardware, trends, the cache, totals."""
-    screen = title_panel(m) + engine_panel(m) + live_panel(m, not opts.compact) + hardware_panel(m)
+    screen = title_panel(m) + engine_panel(m) + live_panel(m)
+    if not opts.compact:
+        screen += slots_panel(m)
+    screen += hardware_panel(m)
     if opts.spark:
         screen += trend_panel(m, opts.spark)
     screen += cache_panel(m) + totals_panel(m)
@@ -281,8 +314,9 @@ def render(m: dict, opts) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="a top-like live view of a running Strata server (it reads the server's own GET /metrics)",
-        epilog="read = the prompt tokens the engine read again (0 = its cache held the whole prompt);"
-               " hit = the expert cache's hit rate; drafts = MTP accepted/offered.")
+        epilog="slots: zone = the config's protected_slots partition; cap = the context that slot fits;"
+               " LOCKED = a long conversation in its grace, eviction never takes it; idle = seconds since used."
+               " read (in the table) = the prompt tokens read again (0 = a full cache reuse).")
     ap.add_argument("url", nargs="?", default="http://127.0.0.1:8080")
     ap.add_argument("--api", default=os.environ.get("STRATA_API_KEY", ""), help="the server's api_key (Bearer)")
     ap.add_argument("--interval", type=float, default=1.0, help="refresh seconds (default 1)")

@@ -1885,17 +1885,29 @@ class StrataEngine:
                                              (cap[b] if cap and cap[b] > 0 else 0), self.slot_used[b]))
 
     def slots_view(self) -> list[dict]:
-        """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
+        """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding.
+        With the config's "protected_slots" each slot also names the zone it serves, the context it fits,
+        whether a long conversation locks it against eviction and how long it has been idle: those are what
+        pick_slot routes on, so a BYIELD that evicts a conversation is visible here slot by slot.  Without the
+        partition the view is exactly as it was (a byte-identical default path)."""
         now, view = time.time(), []
+        zones = getattr(self, "slot_zone", None)
+        caps = getattr(self, "slot_cap", None)
         for b in range(self.batch):
             r = self.slot_live[b]
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
-                continue
-            ft = r.get("first_token")
-            view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
-                         "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
+                v: dict = {"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])}
+            else:
+                ft = r.get("first_token")
+                v = {"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
+                     "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
+                     "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None}
+            if zones:
+                v["zone"] = zones[b]
+                v["cap"] = caps[b] if caps and b < len(caps) else 0
+                v["locked"] = self._slot_locked(b)
+                v["idle_s"] = round(now - self.slot_used[b], 1)
+            view.append(v)
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):

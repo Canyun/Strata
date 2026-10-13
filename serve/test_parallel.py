@@ -287,6 +287,25 @@ class PickSlot(unittest.TestCase):
         self.assertEqual(v[0]["state"], "decoding")
         self.assertEqual(v[0]["generated"], 4)
         self.assertEqual(v[1], {"slot": 1, "state": "idle", "held_tokens": 2})
+        self.assertNotIn("zone", v[1])      # no "protected_slots": the view is exactly as it was
+
+    def test_slots_view_shows_the_partition(self):
+        """With the config's "protected_slots" the view names each slot's zone, its capacity, whether a long
+        conversation locks it against eviction and how long it has been idle: the partition is what a request
+        routes on, so /metrics shows it, and the eviction a BYIELD causes becomes visible slot by slot."""
+        e = self.engine(3)
+        e.slot_zone = ["protected", "protected", "guest"]
+        e.slot_cap = [200000, 200000, 98304]
+        e.slot_held[0] = list(range(20000))                     # a conversation over the lock's size floor
+        e.slot_used[0] = time.time()                            # ... and used now: locked
+        e.slot_held[2] = list(range(20000))
+        e.slot_used[2] = time.time() - 4000                     # idle past the 1800 s grace: evictable
+        v = e.slots_view()
+        self.assertEqual((v[0]["zone"], v[0]["cap"], v[0]["locked"]), ("protected", 200000, True), v[0])
+        self.assertLess(v[0]["idle_s"], 5, v[0])
+        self.assertEqual((v[1]["zone"], v[1]["cap"], v[1]["locked"]), ("protected", 200000, False), v[1])
+        self.assertEqual((v[2]["zone"], v[2]["cap"], v[2]["locked"]), ("guest", 98304, False), v[2])
+        self.assertGreater(v[2]["idle_s"], 3000, v[2])
 
 
 class ParallelService(unittest.TestCase):

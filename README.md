@@ -1,5 +1,25 @@
 <h1 align="center">Strata</h1>
 
+> **本仓库特化说明（fork 本地改动）**
+>
+> 本仓库是 [Niko1221/Strata](https://github.com/Niko1221/Strata) 的 fork，针对**多路 agent 并发 + 常驻长上下文会话**场景做了以下改动（仅 `serve/server.py`，纯 Python，零 C++）：
+>
+> - **`protected_slots`**（配置顶层字段）：批次槽位分区。把指定槽位保留给带检查点的常驻会话（`zone="protected"`），一次性调用（`strata_checkpoint: false`，发为 `ckpt=0`）落入其余 `guest` 槽位。二者互不驱逐——常驻会话的缓存不再被过客请求清掉。
+> - **`solo_path`**（配置顶层字段，默认 `true`）：设为 `false` 时，每个请求留在自己的批次槽位（`BGEN`），不再走全进程唯一的 solo 检查点链（`GEN`）。solo 链是赢家通吃的——任何跑过它的请求（含一次性调用）都会覆写常驻会话留下的链，使该会话下一轮从零重读整个 prompt。关掉后每个会话守住自己槽位的缓存。
+> - **槽位淘汰保护**：`pick_slot` 按请求 zone 过滤候选；持有长会话（≥16384 token）且在空闲宽限期（30 分钟）内的槽位被锁定，短请求无法抢占。
+>
+> 配置示例：
+>
+> ```json
+> {
+>   "parallel": 4,
+>   "protected_slots": [0, 1, 2],
+>   "solo_path": false
+> }
+> ```
+>
+> 默认值（不设 `protected_slots`、`solo_path: true`）与上游行为逐字节一致。测试见 `serve/test_parallel.py`、`serve/test_slot_alloc.py`。本 fork 的性能收益尚在本机 A/B 实测中，未给出数字前不作为结论。
+
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>

@@ -261,7 +261,9 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [True] * 3
         self.assertIsNone(e.pick_slot([7, 8]))
         e.slot_busy = [False] * 3
-        self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
+        # a slot holding the whole prompt is a match (it used to score 0 and send the turn to an empty slot).  Both
+        # slot 0 and slot 2 start with this prompt: the tie goes to the least recently used, slot 0
+        self.assertEqual(e.pick_slot([1, 2, 3]), 0)
 
     def test_batch_groups_spread_requests_over_the_groups(self):
         # #1249: with --batch-groups 2 over 4 slots (groups {0,1} and {2,3}) a second request goes to the other group,

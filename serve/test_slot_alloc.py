@@ -130,17 +130,19 @@ class Capacity(unittest.TestCase):
 
 
 class Locking(unittest.TestCase):
-    """A slot holding a long, recently-used conversation is protected: the eviction never takes it, and when every
-    free slot is protected pick_slot returns None (the caller queues) rather than evicting a hot conversation."""
+    """A slot holding a long, recently-used conversation is protected: the pick orders it after the unlocked ones,
+    so a short request evicts a cold slot first.  The lock is a weight, never a veto - see LockIsAWeight for why
+    refusing every slot starves the request instead of protecting the conversation."""
 
-    def test_all_slots_protected_returns_none(self):
-        # the tooth: every slot holds a hot long conversation - evicting any is a rebuild the lock forbids
+    def test_all_slots_protected_takes_the_least_recently_used(self):
+        # the lock is a weight: when every free slot holds a hot chain the pick still returns one (the least
+        # recently used), because queueing the request starves the conversation whose next turn it is
         e = engine(2, 1, pipelined=False, slot_cap=[204800, 204800])
         e.slot_held[0] = list(range(200000))
         e.slot_held[1] = list(range(200000))
         e.slot_used[0] = time.time()
-        e.slot_used[1] = time.time() - 60          # both inside the idle grace: both protected
-        self.assertIsNone(e.pick_slot(list(range(3000))))
+        e.slot_used[1] = time.time() - 60          # both inside the idle grace: both locked
+        self.assertEqual(e.pick_slot(list(range(3000))), 1)
 
     def test_lock_expires_when_idle_past_grace(self):
         # an idle long conversation past the grace is dead: its slot is evictable again
@@ -204,13 +206,13 @@ class OneGroup(unittest.TestCase):
     def test_reuse_then_least_recently_used(self):
         e = engine(4, 1, pipelined=False)
         e.slot_held[2] = [1, 2]
-        self.assertEqual(e.pick_slot([1, 2, 3]), 2)        # its conversation's next turn
-        e.slot_held[2] = [9]
+        self.assertEqual(e.pick_slot([1, 2, 3]), 2)        # its conversation's next turn (the longest shared start)
         e.slot_held = [[5], [], [9], [6]]
-        self.assertEqual(e.pick_slot([1, 2, 3]), 1)        # an empty slot before evicting a held one
-        e.slot_held[1] = [8]
+        self.assertEqual(e.pick_slot([1, 2, 3]), 1)        # nothing shares a token: the empty slot
+        # nothing shares a token and none is empty: the least recently used, and the idle age decides it
+        e.slot_held = [[5], [7], [9], [6]]
         e.slot_used = [5.0, 3.0, 9.0, 1.0]
-        self.assertEqual(e.pick_slot([1, 2, 3]), 3)        # else the least recently used
+        self.assertEqual(e.pick_slot([1, 2, 3]), 3)
 
 
 class InfoParse(unittest.TestCase):
@@ -250,6 +252,83 @@ class EffectiveContext(unittest.TestCase):
 
     def test_heterogeneous_raises_to_the_widest_slot(self):
         self.assertEqual(effective_max_context(32768, [204800, 50000]), 204800)
+
+
+class LongestPrefix(unittest.TestCase):
+    """The pick is by shared prefix length, not by a whole-array match: a slot that shares 30,000 tokens with the
+    prompt is worth more than one that shares none, even when neither holds the prompt's entire start.  A prompt
+    that shares only part of a slot's chain still returns it - the engine reads the rest, which is the cost of a
+    change the server cannot see (a client that rewrites its system prompt between turns)."""
+
+    def test_a_partial_prefix_returns_the_slot(self):
+        # the v0.1.44 case: the slot holds 30,293, the prompt shares its first 30,116 - the old whole-array match
+        # scored 0 and the request went to an empty slot, so the protected slots filled up one turn at a time
+        e = engine(3, 1, pipelined=False, protected=[0, 1, 2])
+        e.slot_held[0] = list(range(30293))
+        e.slot_used[0] = time.time()
+        self.assertEqual(e.pick_slot(list(range(30116)) + [9999] * 100, "protected"), 0)
+
+    def test_the_longest_shared_prefix_wins(self):
+        e = engine(3, 1, pipelined=False, protected=[0, 1, 2])
+        prompt = list(range(1000))
+        e.slot_held[1] = prompt[:900]          # the longest start of this prompt
+        e.slot_held[2] = prompt[:100]
+        self.assertEqual(e.pick_slot(prompt, "protected"), 1)
+
+    def test_a_prefix_beats_a_never_used_slot(self):
+        # a never-used slot is the best eviction target, but not a better match than a longer prefix
+        e = engine(3, 1, pipelined=False, protected=[0, 1, 2])
+        e.slot_held[0] = list(range(30293))
+        e.slot_used[0] = time.time() - 30
+        self.assertEqual(e.pick_slot(list(range(30116)), "protected"), 0)
+
+    def test_a_whole_prefix_is_a_match(self):
+        # a slot holding exactly the prompt is the perfect match, never "no match" (the old test used < not <=)
+        e = engine(2, 1, pipelined=False, protected=[0, 1])
+        e.slot_held[0] = list(range(1000))
+        self.assertEqual(e.pick_slot(list(range(1000)), "protected"), 0)
+
+
+class LockIsAWeight(unittest.TestCase):
+    """The lock orders the free slots, it never refuses them.  A locked slot is taken when nothing else fits the
+    prompt, because queueing the request starves the conversation whose next turn it is (the hang of v0.1.44:
+    three turns of one conversation, three locked slots, the fourth turn cancelled at 114 s)."""
+
+    def test_lcp_beats_the_lock(self):
+        # a slot sharing 30,000 tokens is worth more than protecting a hot chain that shares none
+        e = engine(2, 1, pipelined=False, protected=[0, 1])
+        e.slot_held[0] = list(range(30116))                 # shares this prompt's whole start
+        e.slot_used[0] = time.time() - 1                    # hot: locked
+        e.slot_held[1] = list(range(200000))                # a hot chain sharing nothing
+        e.slot_used[1] = time.time() - 1                    # hot: locked too
+        self.assertEqual(e.pick_slot(list(range(30116)), "protected"), 0)
+
+    def test_a_free_unlocked_slot_is_taken_before_a_locked_one(self):
+        # neither shares anything: the lock still keeps the hot chain
+        e = engine(2, 1, pipelined=False, protected=[0, 1])
+        e.slot_held[0] = list(range(200000))
+        e.slot_used[0] = time.time() - 1                    # hot: locked
+        e.slot_held[1] = list(range(200000))
+        e.slot_used[1] = time.time() - (StrataEngine.SLOT_PROTECT_IDLE_GRACE_S + 1)   # cold: not locked
+        self.assertEqual(e.pick_slot(list(range(3000)), "protected"), 1)
+
+    def test_every_slot_locked_never_returns_none(self):
+        e = engine(3, 1, pipelined=False, protected=[0, 1, 2])
+        now = time.time()
+        for b, held in enumerate((95277, 96869, 100708)):
+            e.slot_held[b] = list(range(held))
+            e.slot_used[b] = now - 30 * b                   # all inside the grace: all locked
+        self.assertIsNotNone(e.pick_slot(list(range(102124)), "protected"))
+
+    def test_the_grace_is_two_minutes(self):
+        # a conversation idle past the grace is dead: its slot gives way without waiting half an hour
+        self.assertEqual(StrataEngine.SLOT_PROTECT_IDLE_GRACE_S, 120.0)
+
+    def test_lock_expires_after_the_grace(self):
+        e = engine(1, 1, pipelined=False, protected=[0])
+        e.slot_held[0] = list(range(200000))
+        e.slot_used[0] = time.time() - 130                  # past the two-minute grace
+        self.assertFalse(e._slot_locked(0))
 
 
 class ZoneConfig(unittest.TestCase):

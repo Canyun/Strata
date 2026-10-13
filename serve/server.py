@@ -1823,25 +1823,28 @@ class StrataEngine:
                         self.slot_cv.notify_all()
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
-    SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
+    SLOT_PREFIX_MIN = 512   # a shared prefix shorter than this is not worth unbalancing the pipeline's groups
     SLOT_PROTECT_MIN_TOKENS = 16384        # a slot holding at least this many tokens is a conversation worth locking
-    SLOT_PROTECT_IDLE_GRACE_S = 1800.0     # ... and used within this idle window; past it the conversation is dead
+    SLOT_PROTECT_IDLE_GRACE_S = 120.0      # ... and used within this idle window; past it the conversation is dead
 
     def _slot_locked(self, slot: int) -> bool:
-        """A slot is locked while it holds a long conversation used within the idle grace: eviction never takes a
-        locked slot, so a short request never evicts a hot conversation whose rebuild it would force (the whole
-        prompt).  An idle slot past the grace holds a dead conversation and is evictable again."""
+        """A slot is locked while it holds a long conversation used within the idle grace: the pick orders it after
+        the unlocked ones, so a short request does not evict a hot conversation whose rebuild it would force (the
+        whole prompt).  An idle slot past the grace holds a dead conversation and is not locked.  A weight, never a
+        veto: with every free slot locked the pick still takes one (see pick_slot)."""
         held_tokens = len(self.slot_held[slot])
         idle_s = time.time() - self.slot_used[slot]
         return held_tokens >= self.SLOT_PROTECT_MIN_TOKENS and idle_s < self.SLOT_PROTECT_IDLE_GRACE_S
 
     def pick_slot(self, prompt: list[int], zone: str = "protected") -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): only slots in the request's zone and wide enough
-        for it; the one whose held tokens are the longest start of the prompt (the engine then reads only the
-        rest), else the smallest-capacity slot that fits it (best-fit: keep the wide slots for the conversations
-        that need them), else the least-recently-used slot that is not locked.  None: every slot in the zone is
-        busy, none is wide enough, or every free one is locked - the caller queues (a slot's capacity never
-        grows, a locked slot never gives way, and a conversation never crosses into the guest slots)."""
+        for it, ordered by the tokens they share with the prompt's start (the longest first: the engine reads only
+        the rest), then unlocked before locked, then the smallest capacity that fits (best-fit: keep the wide slots
+        for the conversations that need them), then the least recently used.  Sharing a prefix is a preference and
+        so is the lock, never a requirement: a slot that shares nothing is still taken, because refusing it queues
+        the request until some other conversation ends - and the queued request is usually the next turn of one of
+        the conversations holding those very slots.  None: every slot in the zone is busy, or none is wide enough
+        (a slot's capacity never grows, and a conversation never crosses into the guest slots)."""
         cap = getattr(self, "slot_cap", None)
         zones = getattr(self, "slot_zone", None)
         need = len(prompt)
@@ -1861,28 +1864,33 @@ class StrataEngine:
                 g0 = b - b % gs
                 return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
             return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
-        def held_prefix(b):
+        def shared_prefix(b):
+            """How many leading tokens this slot and the prompt have in common.  What the engine can reuse is its
+            own decision (it answers with RESUME), so the server only ranks the candidates: a slot holding part of
+            the prompt's start is the best of them, and the rest is read again."""
             h = self.slot_held[b]
-            return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
-        best = max(free, key=held_prefix)
-        # without --batch-groups a held prefix of any length is taken, as before
-        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
-            return best
+            n = min(len(h), len(prompt))
+            i = 0
+            while i < n and h[i] == prompt[i]:
+                i += 1
+            return i
+        if _BTRACE:
+            btrace(f"pick_slot need={len(prompt)} zone={zone} free={free}",
+                   [f"slot{b}:shared{shared_prefix(b)}:held{len(self.slot_held[b])}"
+                    for b in range(self.batch)])
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
-        # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
+        # pipeline's stages (two requests in one group leave the other stage idle).  A long shared prefix is worth
+        # the unbalanced group - the tokens it saves are read either way - but a short one is not, which is why the
+        # prefix is a separate key that only breaks the tie once it passes SLOT_PREFIX_MIN
         busy_in = {}
         for b in range(self.batch):
             if self.slot_busy[b]:
                 busy_in[self.slot_group[b]] = busy_in.get(self.slot_group[b], 0) + 1
-        # eviction never takes a locked slot: with every free slot locked there is nothing safe to evict, so return
-        # None and let the caller queue - evicting a hot conversation forces a rebuild of its whole prompt, never
-        # worth a short request that needs the slot for a moment
-        evictable = [b for b in free if not self._slot_locked(b)]
-        if not evictable:
-            return None
-        return min(evictable, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
-                                             bool(self.slot_held[b]),
-                                             (cap[b] if cap and cap[b] > 0 else 0), self.slot_used[b]))
+        spread = self.slot_groups > 1 and self.SLOT_PREFIX_MIN > 0
+        return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if spread
+                                        and shared_prefix(b) < self.SLOT_PREFIX_MIN else 0,
+                                        -shared_prefix(b), self._slot_locked(b), bool(self.slot_held[b]),
+                                        cap[b] if cap and cap[b] > 0 else 0, self.slot_used[b]))
 
     def slots_view(self) -> list[dict]:
         """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding.

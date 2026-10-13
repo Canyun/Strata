@@ -30,6 +30,12 @@ def val(x, unit: str = "") -> str:
     return "-" if x is None else f"{x}{unit}"
 
 
+def rate(x, unit: str = "") -> str:
+    """A reading that arrives as a float (a PCIe throughput, a wattage) rounded to a whole number, so the row it
+    shares with a sparkline stays the same width second by second."""
+    return "-" if x is None else f"{x:,.0f}{unit}"
+
+
 def gib(nbytes) -> str:
     """Bytes as GiB (telemetry reports mem_used, mem_total and ram_* in bytes)."""
     return "-" if nbytes is None else f"{nbytes / 1024 ** 3:.1f}"
@@ -48,6 +54,11 @@ def pct(ratio, digits: int = 1) -> str:
 def p100(x, digits: int = 0) -> str:
     """A value already in percent (a GPU's load, a CPU's) as a string."""
     return "-" if x is None else f"{x:.{digits}f}%"
+
+
+def on_off(x) -> str:
+    """A 0/1 flag the engine reports as an int (vram_elastic, slot_cache) as a word."""
+    return "-" if x is None else ("on" if x else "off")
 
 
 def share(part, whole, digits: int = 1) -> str:
@@ -105,7 +116,7 @@ def title_panel(m: dict) -> list[str]:
              f"ctx {num(eng.get('max_context'))}", f"state {live.get('state')}",
              f"queued {live.get('queued', 0)}"]
     if totals.get("since"):
-        parts.append(f"up {dur_text(time.time() - totals['since'])}")
+        parts.append(f"up {dur_text(m.get('time', time.time()) - totals['since'])}")
     parts.append(time.strftime("%H:%M:%S"))
     return ["  ".join(parts)]
 
@@ -115,15 +126,19 @@ def engine_panel(m: dict) -> list[str]:
     eng = m.get("engine", {})
     kv = f"kv {val(eng.get('kv'))}" + (f" (resident {num(eng.get('kv_resident'))})" if eng.get("kv_resident") else "")
     rows = [(f"engine    {kv}   ctx {num(eng.get('context'))}   vram free {val(eng.get('vram_free_mib'), ' MiB')}"
-             f"   elastic {val(eng.get('vram_elastic'))}"),
+             f"   elastic {on_off(eng.get('vram_elastic'))}"),
             (f"experts   {num(eng.get('expert_slots'))} slots / {gib_from_mib(eng.get('expert_cache_mib'))} GiB"
-             f"  (primary {num(eng.get('expert_slots_primary'))} / {gib_from_mib(eng.get('expert_cache_primary_mib'))} GiB)"
-             f"   arena {gib_from_mib(eng.get('arena_mib'))} GiB   workers {val(eng.get('pool_workers'))}"),
+             f"  (primary {num(eng.get('expert_slots_primary'))} / {gib_from_mib(eng.get('expert_cache_primary_mib'))}"
+             f" GiB)   in RAM {gib_from_mib(eng.get('arena_mib'))} GiB   workers {val(eng.get('pool_workers'))}"),
             (f"drafter   MTP {val(eng.get('spec'))} (max {val(eng.get('mtp_max'))})   lookup {val(eng.get('lookup'))}"
              f"   min_p {val(eng.get('spec_min_p'))}   pcie_frac {val(eng.get('pcie_frac'))}")]
     if eng.get("batch_slots"):
-        rows.append(f"batch     slots {val(eng.get('batch_slots'))}   slot_cache {val(eng.get('slot_cache'))}"
-                    f"   groups {val(eng.get('batch_groups'))}")
+        caps = [c for c in str(eng.get("slot_caps") or "").split(",") if c.strip().isdigit()]
+        row = (f"batch     slots {val(eng.get('batch_slots'))}   slot_cache {on_off(eng.get('slot_cache'))}"
+               f"   groups {val(eng.get('batch_groups'))}")
+        if caps:
+            row += "   slot contexts " + ", ".join(num(int(c)) for c in caps)
+        rows.append(row)
     return rows
 
 
@@ -133,9 +148,10 @@ def live_panel(m: dict) -> list[str]:
     state = live.get("state")
     rows = []
     if state == "generating":
+        phase = f"  [{live['phase']}]" if live.get("phase") else ""
         rows.append(f"decode    {val(live.get('tok_s'), ' tok/s')}  (mean {val(live.get('tok_s_mean'))})"
                     f"   {num(live.get('generated'))}/{num(live.get('max_tokens'))} tok"
-                    f"   {val(live.get('elapsed_s'), 's')}")
+                    f"   {val(live.get('elapsed_s'), 's')}{phase}")
     elif state == "reading":
         read, total = live.get("prompt_read"), live.get("prompt_total")
         rows.append(f"prefill   {val(live.get('prefill_tok_s_mean'), ' tok/s')}   read {num(read)}/{num(total)}"
@@ -145,15 +161,20 @@ def live_panel(m: dict) -> list[str]:
     if live.get("parallel"):
         rows.append(f"parallel  {live.get('running', 0)}/{live.get('parallel')} running"
                     f"   waiting {live.get('waiting', 0)}   admitting {live.get('admitting', 0)}"
-                    f"   outside slots {live.get('outside_slots', 0)}")
+                    f"   outside slots {live.get('outside_slots', 0)}"
+                    + ("  <- the solo path" if live.get("outside_slots") else ""))
+    else:
+        rows.append('parallel  off   one request at a time ("parallel": N in the config opens N batch slots,'
+                    " and the slot panel with it)")
     return rows
 
 
 def slots_panel(m: dict) -> list[str]:
     """Every batch slot: its zone, the context it fits, what it runs and, when idle, the tokens it holds for the
     conversation that will come back to it.  A locked slot holds a long conversation used inside the grace, so
-    eviction never takes it; an idle slot past the grace holds a dead conversation and can be taken.  `read`
-    capacity is what pick_slot routes on: a prompt wider than a slot's cap never lands in it."""
+    eviction never takes it; an idle slot past the grace holds a dead conversation and can be taken.  `cap` is the
+    read capacity pick_slot routes on: a prompt wider than a slot's cap never lands in it, so a request that reads
+    its whole prompt again is a request that found no slot wide enough for it."""
     live = m.get("live", {})
     slots = live.get("slots") or []
     if not slots:
@@ -164,32 +185,37 @@ def slots_panel(m: dict) -> list[str]:
         protected = sum(1 for z in zones if z == "protected")
         head += f"  ({protected} protected / {len(zones) - protected} guest)"
     rows = [head]
-    if slots[0].get("zone"):
-        rows.append(f"          {'':<8} {'zone':<10} {'cap':>9}  {'state':<10} {'tokens':>16}"
-                    f" {'tok/s':>8} {'idle':>8}  flags")
+    if zones:
+        rows.append(f"{'':<10} {'zone':<10} {'cap':>9}  {'state':<11} {'tokens':>17}"
+                    f"  {'tok/s':>8}  {'idle':>7}  flags")
     for s in slots:
         slot_id = f"  slot {s.get('slot')}"
-        tokens = (f"gen {num(s.get('generated'))}/{num(s.get('prompt_tokens'))}"
-                  if s.get("state") != "idle" else f"holds {num(s.get('held_tokens'))}")
-        if not s.get("zone"):
-            rows.append(f"{slot_id:<10} {s.get('state')!s:<10}"
-                        f"  {tokens:>16}   {val(s.get('tok_s')):>8}   {val(s.get('elapsed_s'), 's'):>8}")
-            continue
-        flags = []
-        if s.get("locked"):
-            flags.append("LOCKED")
-        if s.get("state") == "idle" and s.get("held_tokens"):
-            flags.append("cache")
-        elif s.get("state") == "idle":
-            flags.append("free")
-        rows.append(f"{slot_id:<10} {s.get('zone')!s:<10} {num(s.get('cap')):>9}"
-                    f"  {s.get('state')!s:<10} {tokens:>16}   {val(s.get('tok_s')):>8}"
-                    f"   {dur_text(s.get('idle_s')):>8}  {','.join(flags)}")
+        if s.get("state") == "idle":
+            tokens = f"holds {num(s.get('held_tokens'))}"
+        elif s.get("state") == "reading":
+            tokens = f"reading {num(s.get('prompt_tokens'))}"
+        else:
+            tokens = f"gen {num(s.get('generated'))}/{num(s.get('prompt_tokens'))}"
+        clock = dur_text(s.get("idle_s")) if zones else val(s.get("elapsed_s"), "s")
+        flags = ""
+        if zones:
+            flags = ",".join((["LOCKED"] if s.get("locked") else [])
+                             + (["cache"] if s.get("state") == "idle" and s.get("held_tokens")
+                                else ["free"] if s.get("state") == "idle" else []))
+        if zones:
+            rows.append(f"{slot_id:<10} {s.get('zone')!s:<10} {num(s.get('cap')):>9}"
+                        f"  {s.get('state')!s:<11} {tokens:>17}  {val(s.get('tok_s')):>8}"
+                        f"  {clock:>7}  {flags}")
+        else:
+            rows.append(f"{slot_id:<10} {s.get('state')!s:<11} {tokens:>17}  {val(s.get('tok_s')):>8}"
+                        f"  {clock:>7}")
     return rows
 
 
 def hardware_panel(m: dict) -> list[str]:
-    """Every card's load, VRAM, temperature, power and PCIe link, then CPU, RAM and disk."""
+    """Every card's load, VRAM, temperature, power and PCIe link, then CPU, RAM and disk.  NVML's PCIe generation is
+    the card's current link, and it drops to gen 1 while the card is idle to save power, so the figure to read is
+    the throughput next to it, not the generation."""
     hw, static = m.get("hardware", {}), m.get("hardware_static", {})
     rows = []
     gpus = hw.get("gpus")
@@ -197,24 +223,31 @@ def hardware_panel(m: dict) -> list[str]:
         for g in gpus:
             used, total = g.get("mem_used"), g.get("mem_total")
             rows.append(f"GPU{g.get('index')}    {bar(g.get('util'))} {p100(g.get('util')):>5}"
-                        f"  VRAM {gib(used)}/{gib(total)} GiB   {bar(used / total * 100 if used and total else None, 8)}"
-                        f"  {val(g.get('temp'), 'C'):>5}  {val(g.get('power'), 'W'):>7}")
+                        f"  VRAM {gib(used)}/{gib(total)} GiB"
+                        f"   {bar(used / total * 100 if used and total else None, 8)}"
+                        f"  {val(g.get('temp'), 'C'):>4}  {rate(g.get('power'), 'W'):>6}")
     else:
         used, total = hw.get("gpu_mem_used"), hw.get("gpu_mem_total")
         rows.append(f"GPU      {bar(hw.get('gpu_util'))} {p100(hw.get('gpu_util')):>5}"
                     f"  VRAM {gib(used)}/{gib(total)} GiB"
-                    f"   {val(hw.get('gpu_temp'), 'C')}  {val(hw.get('gpu_power'), 'W')}")
-    rows.append(f"PCIe     gen {val(hw.get('pcie_gen'))} x{val(hw.get('pcie_width'))}"
-                f" (max gen {val(hw.get('pcie_gen_max'))})   rx {val(hw.get('gpu_pcie_rx_mb'))} MB/s"
-                f"   tx {val(hw.get('gpu_pcie_tx_mb'))} MB/s")
+                    f"   {val(hw.get('gpu_temp'), 'C')}  {rate(hw.get('gpu_power'), 'W')}")
+    gen = hw.get("pcie_gen")
+    link = f"gen {val(gen)} x{val(hw.get('pcie_width'))}"
+    if gen is not None and hw.get("pcie_gen_max") and gen < hw["pcie_gen_max"]:
+        link += f" (the card's max is gen {hw['pcie_gen_max']}: NVML reads the idle link, so trust the MB/s)"
+    rows.append(f"PCIe     {link}   rx {rate(hw.get('gpu_pcie_rx_mb'), ' MB/s')}"
+                f"   tx {rate(hw.get('gpu_pcie_tx_mb'), ' MB/s')}")
     cpu, ram_used, ram_total = hw.get("cpu"), hw.get("ram_used"), hw.get("ram_total")
     rows.append(f"CPU      {bar(cpu)} {p100(cpu):>5}   RAM {gib(ram_used)}/{gib(ram_total)} GiB"
                 f"   {bar(ram_used / ram_total * 100 if ram_used and ram_total else None, 8)}"
-                f"  disk r{val(hw.get('disk_read_mb'))} w{val(hw.get('disk_write_mb'))} MB/s")
-    if static.get("cpu_name"):
-        rows.append(f"host     {static.get('cpu_name')}   {val(static.get('cores'))} cores"
-                    f" / {val(static.get('threads'))} threads   psutil"
-                    f" {'yes' if static.get('psutil') else 'no'}")
+                f"  free {gib((ram_total or 0) - (ram_used or 0)) if ram_total and ram_used is not None else '-'} GiB"
+                f"   disk r{rate(hw.get('disk_read_mb'))} w{rate(hw.get('disk_write_mb'))} MB/s")
+    if static.get("gpu_name") or static.get("cpu_name"):
+        host = static.get("cpu_name") or "?"
+        rows.append(f"host     {host}   {val(static.get('cores'))} cores / {val(static.get('threads'))} threads"
+                    f"   {static.get('gpu_count') or len(gpus or [1])} GPU: {static.get('gpu_name') or '-'}")
+    if static.get("gpu_note"):
+        rows.append(f"note     {static['gpu_note']}")
     return rows
 
 
@@ -229,40 +262,45 @@ def trend_panel(m: dict, width: int) -> list[str]:
         if not series:
             continue
         current = current_of[source].get(key)
-        shown = gib(current) if unit == " GiB" else val(current)
+        shown = gib(current) if unit == " GiB" else (rate(current) if unit == " MB/s" else val(current))
         rows.append(f"          {label:<12} {spark(series, width)}  {shown}{unit}")
     return rows
 
 
 def cache_panel(m: dict) -> list[str]:
-    """The conversation cache: its budget, what is parked, the parks/restores/evictions and the prompt reuse."""
+    """The conversation cache: its budget, what is parked, the parks/restores/evictions and the prompt reuse.
+    The reuse counts are the server's totals, so they report the prompt read again with the cache OFF too - that
+    is the number a slot's own KV is spending, which is what a partition and a lock are there to bring down."""
     cc = m.get("conversation_cache")
     if not cc:
         return []
     rows = []
     if cc.get("enabled"):
         rows.append(f"conv cache  on   budget {gib_from_mib(cc.get('budget_mib'))} GiB"
-                    f"   slots {val(cc.get('slots'))}   parked {num(cc.get('parked'))} ({gib(cc.get('bytes'))} GiB)")
+                    f"   slots {val(cc.get('slots'))}   parked {num(cc.get('parked'))} ({gib(cc.get('bytes'))} GiB)"
+                    f"   {num(cc.get('parks'))} parks / {num(cc.get('restores'))} restores"
+                    f" / {num(cc.get('evictions'))} evictions")
+        if cc.get("last_event"):
+            rows[-1] += f"   last: {cc['last_event']} {num(cc.get('last_tokens'))} tok"
     else:
-        rows.append("conv cache  OFF   conversations keep only their slot's KV")
-    rows.append(f"parking     {num(cc.get('parks'))} parks   {num(cc.get('restores'))} restores"
-                f"   {num(cc.get('evictions'))} evictions   last: {cc.get('last_event') or '-'}")
+        rows.append("conv cache  OFF   a conversation keeps only its slot's KV (a parked turn: 0)")
     rows.append(f"reuse       {num(cc.get('reused_tokens'))}/{num(cc.get('prompt_tokens'))} prompt tok"
-                f"  ({share(cc.get('reused_tokens'), cc.get('prompt_tokens'))})"
-                f"   last request {num(cc.get('last_reused'))}/{num(cc.get('last_prompt'))}")
+                f"  ({share(cc.get('reused_tokens'), cc.get('prompt_tokens'))} given back)"
+                f"   last {num(cc.get('last_reused'))}/{num(cc.get('last_prompt'))}")
     return rows
 
 
 def totals_panel(m: dict) -> list[str]:
-    """The running totals: requests, the tokens read again, the output, the MTP drafts accepted and the mean rates."""
+    """The running totals: requests, the tokens read again, the output, the MTP drafts accepted and the rates since
+    the server started (a mean over everything it has done, so they move slowly and follow the cache, not one turn)."""
     t = m.get("totals") or {}
     prompt = t.get("prompt_tokens")
+    again = (prompt or 0) - (t.get("reused") or 0)
     return [(f"totals    {num(t.get('requests'))} requests   prompt {num(prompt)} tok"
-             f"   read again {num((prompt or 0) - (t.get('reused') or 0))}"
-             f" ({share((prompt or 0) - (t.get('reused') or 0), prompt)})   output {num(t.get('output_tokens'))} tok"),
+             f"   read again {num(again)} ({share(again, prompt)})   output {num(t.get('output_tokens'))} tok"),
             (f"          MTP accepted {num(t.get('drafts_accepted'))}/{num(t.get('drafts_offered'))}"
              f" ({share(t.get('drafts_accepted'), t.get('drafts_offered'))})"
-             f"   prefill {tok_s(prompt, t.get('prompt_ms'))} tok/s"
+             f"   since start: prefill {tok_s(prompt, t.get('prompt_ms'))} tok/s"
              f"   decode {tok_s(t.get('output_tokens'), t.get('decode_ms'))} tok/s")]
 
 
@@ -276,7 +314,8 @@ def expert_row(r: dict) -> str | None:
 
 
 def history_table(m: dict, rows: int) -> list[str]:
-    """The finished requests as a table. `read` is what the engine read again: a full cache reuse is 0."""
+    """The finished requests as a table. `read` is what the engine read again: a full cache reuse is 0, and a read
+    as wide as the prompt is a turn that lost its checkpoint - the column to watch when testing a partition."""
     shown = (m.get("requests") or [])[:rows]
     if not shown:
         return []
@@ -308,7 +347,7 @@ def render(m: dict, opts) -> str:
     screen += cache_panel(m) + totals_panel(m)
     if opts.history:
         screen += history_table(m, opts.history)
-    return "\n".join(screen)
+    return "\n".join(line.rstrip() for line in screen)
 
 
 def main() -> int:
@@ -316,16 +355,21 @@ def main() -> int:
         description="a top-like live view of a running Strata server (it reads the server's own GET /metrics)",
         epilog="slots: zone = the config's protected_slots partition; cap = the context that slot fits;"
                " LOCKED = a long conversation in its grace, eviction never takes it; idle = seconds since used."
-               " read (in the table) = the prompt tokens read again (0 = a full cache reuse).")
+               " read (in the table) = the prompt tokens read again (0 = a full cache reuse)."
+               " A PCIe generation below the card's max is NVML reading the idle link: read the MB/s.")
     ap.add_argument("url", nargs="?", default="http://127.0.0.1:8080")
     ap.add_argument("--api", default=os.environ.get("STRATA_API_KEY", ""), help="the server's api_key (Bearer)")
     ap.add_argument("--interval", type=float, default=1.0, help="refresh seconds (default 1)")
     ap.add_argument("--history", type=int, default=6, help="rows of finished requests (0 turns the table off)")
     ap.add_argument("--spark", type=int, default=44, help="sparkline width (0 turns the trends off)")
     ap.add_argument("--compact", action="store_true", help="the essentials only: no slots, no trends, no table")
+    ap.add_argument("--once", action="store_true", help="print one screen and exit (a log, a bug report)")
     opts = ap.parse_args()
     if opts.compact:
         opts.history, opts.spark = 0, 0
+    if opts.once:
+        print(render(fetch(opts.url, opts.api), opts))
+        return 0
     try:
         while True:
             try:

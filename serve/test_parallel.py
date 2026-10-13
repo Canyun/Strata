@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, parallel_args, serve
+from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, parallel_args, serve, solo_path_of
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -222,6 +222,21 @@ class ParallelArgs(unittest.TestCase):
         self.assertEqual(args[-2:], ["--batch", "2"])
 
 
+class SoloPathSetting(unittest.TestCase):
+    """The config's top-level "solo_path" switch (like "parallel"): the request that arrives alone on the solo path
+    is fine for a session that will be continued, but a one-shot call that runs there overwrites the single
+    process-wide chain a checkpointed conversation left, and its next turn reads its whole prompt again.  "solo_path":
+    false keeps every request in its own slot."""
+    def test_the_default_is_the_solo_path(self):
+        self.assertTrue(solo_path_of({}))
+        self.assertTrue(solo_path_of({"solo_path": True}))
+        self.assertTrue(solo_path_of({"solo_path": "on"}))
+    def test_the_solo_path_off(self):
+        self.assertFalse(solo_path_of({"solo_path": False}))
+        self.assertFalse(solo_path_of({"solo_path": "0"}))
+        self.assertFalse(solo_path_of({"solo_path": "off"}))
+
+
 class PickSlot(unittest.TestCase):
     def engine(self, n):
         e = StrataEngine("missing-executable", [], lazy=True)
@@ -277,7 +292,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0, more=()):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0, more=(), solo_path=None):
         import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -292,7 +307,7 @@ class ParallelService(unittest.TestCase):
         extra += list(more)
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
-            self.engine = StrataEngine("strata", extra)
+            self.engine = StrataEngine("strata", extra, solo_path=solo_path)
         tok = ByteTokenizer()
         self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
@@ -610,6 +625,33 @@ class ParallelService(unittest.TestCase):
         self.assertFalse(any(self.engine.slot_busy))
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 2)
+
+    def test_solo_path_off_keeps_a_solo_request_in_a_slot(self):
+        """"solo_path": false: a request that arrives alone goes to a batch slot (BGEN), not the solo path (GEN):
+        the solo path's one process-wide chain is what a one-shot call overwrites, so a conversation's next turn
+        reads its whole prompt again.  The alone request decodes in a slot and nothing lands on the solo chain."""
+        self.start(2, solo_path=False)
+        self.assertEqual(self.chat("a request that is alone")["choices"][0]["message"]["content"], "ok, done.")
+        kinds = [x.split()[0] for x in self.log.read_text().splitlines()]
+        self.assertIn("BGEN", kinds)
+        self.assertNotIn("GEN", kinds)
+
+    def test_solo_path_off_keeps_a_left_alone_request_in_its_slot(self):
+        """"solo_path": false: a request decoding in a slot whose neighbour finished stays in the slot (no GEN
+        for the drafts) - it is the same chain a one-shot call would overwrite, and STRATA_PARALLEL_SOLO=0
+        already kept it in the slot."""
+        self.start(2, slot_cache=True, solo_path=False)
+        res = {}
+        long = threading.Thread(target=lambda: res.setdefault("long", self.chat("LONGREPLY please", max_tokens=200)))
+        long.start()
+        time.sleep(0.05)
+        short = self.chat("short", max_tokens=200)
+        long.join(30)
+        self.assertEqual(short["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(res["long"]["choices"][0]["message"]["content"], "ok, " + "la " * 15 + "done.")
+        kinds = [x.split()[0] for x in self.log.read_text().splitlines()]
+        self.assertEqual(kinds[-1], "BGEN", kinds)      # the long one stayed in its slot: no GEN after the BGENs
+        self.assertFalse(any(k == "GEN" for k in kinds), kinds)
 
     def test_next_turn_goes_back_to_its_slot(self):
         self.start(2)

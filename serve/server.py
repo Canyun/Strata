@@ -768,9 +768,12 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
-        self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
-        self.session_save_reclaim = '--session-save-reclaim' in args
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
+                 protected_slots: list[int] | str | None = None, solo_path: bool | str | None = None):
+        # protected_slots rides in spawn: restart() runs __init__(*self.spawn), so a partition a live engine loses
+        # on a crash-restart would silently drop the guest zone and let one-shot calls evict conversations.
+        # The 0 is _attempt: a restart starts its try count over (and the tuple is positional, so it must be here).
+        self.spawn = (exe, list(args), cwd, log, env, False, cpus, 0, protected_slots, solo_path)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -930,6 +933,19 @@ class StrataEngine:
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
+        # --slot-contexts: the per-slot contexts the engine reports (INFO slot_caps=a,b,c, 0 = homogeneous).
+        # A slot only takes a prompt its capacity holds; the widest slot is the context the server reports and
+        # refuses against, so a prompt no slot fits fails at the request entry, never queued on a full table.
+        self.slot_cap = slot_caps_of(self.info, self.batch)
+        if self.slot_cap:
+            self.max_context = effective_max_context(self.max_context, self.slot_cap)
+            self.known_ctx = self.max_context
+        # "protected_slots" in the config: the slot partition - the slots a checkpointed conversation may take and
+        # the rest, which serve the one-shot calls.  The server's routing decides it; the engine names a free
+        # slot in BGEN and does not know zones exist, so it is a config setting, never an engine argument.
+        self.slot_zone = protected_slots_of(self.batch, {"protected_slots": protected_slots})
+        # "solo_path": false in the config keeps every request in a batch slot, off the solo path (see solo_path_of)
+        self.solo_path = solo_path_of({"solo_path": solo_path})
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
@@ -1464,7 +1480,8 @@ class StrataEngine:
         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
         slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
-                not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
+                not (self.info or {}).get("slot_cache") or getattr(self, "solo_path", True) is False or
+                os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
             return False
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
@@ -1488,6 +1505,10 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
+        # "protected_slots": the request's zone (a one-shot ckpt=0 call is a guest, a conversation is protected).
+        # It is computed once: every pick_slot below - the #1994 refusal that picks a new slot as well - uses the
+        # same zone, so a conversation never drifts into the guest slots and a guest never takes its chain.
+        zone = zone_of(sampling)
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1511,7 +1532,7 @@ class StrataEngine:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
-                    alone = not any(self.slot_busy) and self.waiting == 0
+                    alone = self.solo_path and not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
@@ -1528,7 +1549,7 @@ class StrataEngine:
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt)
+                                reserved = self.pick_slot(prompt, zone)
                                 if reserved is not None:
                                     self.slot_busy[reserved] = True
                                     self.slot_claims.add(reserved)
@@ -1576,7 +1597,7 @@ class StrataEngine:
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
                         while True:
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                slot = self.pick_slot(prompt, zone)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
@@ -1591,7 +1612,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, zone) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
@@ -1602,7 +1623,7 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, zone) is None:
                                     self.slot_cv.wait(timeout=1.0)
                             if cancel.is_set():
                                 return
@@ -1803,12 +1824,31 @@ class StrataEngine:
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
+    SLOT_PROTECT_MIN_TOKENS = 16384        # a slot holding at least this many tokens is a conversation worth locking
+    SLOT_PROTECT_IDLE_GRACE_S = 1800.0     # ... and used within this idle window; past it the conversation is dead
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
-        """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
-        prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
-        conversations other slots hold stay for their next turns.  None: every slot is busy."""
-        free = [b for b in self.slot_order if not self.slot_busy[b]]
+    def _slot_locked(self, slot: int) -> bool:
+        """A slot is locked while it holds a long conversation used within the idle grace: eviction never takes a
+        locked slot, so a short request never evicts a hot conversation whose rebuild it would force (the whole
+        prompt).  An idle slot past the grace holds a dead conversation and is evictable again."""
+        held_tokens = len(self.slot_held[slot])
+        idle_s = time.time() - self.slot_used[slot]
+        return held_tokens >= self.SLOT_PROTECT_MIN_TOKENS and idle_s < self.SLOT_PROTECT_IDLE_GRACE_S
+
+    def pick_slot(self, prompt: list[int], zone: str = "protected") -> int | None:
+        """A free slot for `prompt` (the caller holds slot_cv): only slots in the request's zone and wide enough
+        for it; the one whose held tokens are the longest start of the prompt (the engine then reads only the
+        rest), else the smallest-capacity slot that fits it (best-fit: keep the wide slots for the conversations
+        that need them), else the least-recently-used slot that is not locked.  None: every slot in the zone is
+        busy, none is wide enough, or every free one is locked - the caller queues (a slot's capacity never
+        grows, a locked slot never gives way, and a conversation never crosses into the guest slots)."""
+        cap = getattr(self, "slot_cap", None)
+        zones = getattr(self, "slot_zone", None)
+        need = len(prompt)
+        free = [b for b in self.slot_order
+                if not self.slot_busy[b]
+                and (not zones or zones[b] == zone)
+                and (not cap or cap[b] <= 0 or cap[b] >= need)]
         if not free:
             return None
         gs = getattr(self, "slot_gs", 0)
@@ -1834,8 +1874,15 @@ class StrataEngine:
         for b in range(self.batch):
             if self.slot_busy[b]:
                 busy_in[self.slot_group[b]] = busy_in.get(self.slot_group[b], 0) + 1
-        return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
-                                        bool(self.slot_held[b]), self.slot_used[b]))
+        # eviction never takes a locked slot: with every free slot locked there is nothing safe to evict, so return
+        # None and let the caller queue - evicting a hot conversation forces a rebuild of its whole prompt, never
+        # worth a short request that needs the slot for a moment
+        evictable = [b for b in free if not self._slot_locked(b)]
+        if not evictable:
+            return None
+        return min(evictable, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
+                                             bool(self.slot_held[b]),
+                                             (cap[b] if cap and cap[b] > 0 else 0), self.slot_used[b]))
 
     def slots_view(self) -> list[dict]:
         """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
@@ -2568,6 +2615,77 @@ def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
     --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
     return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
+
+
+def slot_caps_of(info: dict, slots: int = 0) -> list[int]:
+    """The per-slot contexts the engine reports in its INFO line (`slot_caps=a,b,c`, heterogeneous slots): the
+    capacity table pick_slot filters on.  Empty list: a homogeneous engine (every slot --max-context) - no filter.
+    `slots` (the engine's batch_slots) is the contract: pick_slot indexes the table by slot id, so it is padded
+    with 0 (no per-slot limit) or truncated to exactly that length - a slot_caps that does not match the slots the
+    engine fitted (the VRAM fit drops slots) never indexes out of range."""
+    raw = info.get("slot_caps")
+    if not raw:
+        return []
+    caps = []
+    for item in str(raw).split(","):
+        item = item.strip()
+        if item.lstrip("-").isdigit():
+            caps.append(int(item))
+    if slots > 0:
+        if len(caps) < slots:
+            caps += [0] * (slots - len(caps))
+        elif len(caps) > slots:
+            caps = caps[:slots]
+    return caps
+
+
+def protected_slots_of(batch: int, cfg: dict) -> list[str]:
+    """The config's "protected_slots" (a list, or a comma string: [0,1,2] / "0,1,2"): the slots reserved for
+    checkpointed conversations; the rest serve the one-shot calls (ckpt=0 - a classification, a pipeline step,
+    a probe) that evict nothing and are not worth a chain.  A top-level setting like "parallel": the partition
+    routes the server's own slots, the engine takes any free slot BGEN names, so it never reaches the engine's
+    command line (an unknown argument there ends the engine).  Empty list: no partition, every slot serves
+    every request (the default, byte-identical)."""
+    raw = (cfg or {}).get("protected_slots")
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, (list, tuple)) else str(raw).replace(",", " ").split()
+    kept = {int(x) for x in items if str(x).strip().lstrip("-").isdigit()}
+    kept = {b for b in kept if 0 <= b < batch}
+    if not kept or len(kept) == batch:   # all slots protected = no partition: keep the byte-identical default
+        return []
+    return ["protected" if b in kept else "guest" for b in range(batch)]
+
+
+def solo_path_of(cfg: dict) -> bool:
+    """The config's top-level "solo_path" (like "parallel"): the request that arrives with every slot free goes to
+    the solo path (GEN: one stream with the MTP drafts, the fastest).  That path is a single chain for the whole
+    process - the next request that runs there overwrites what a checkpointed conversation left on it, and that
+    conversation's next turn reads its whole prompt again.  "solo_path": false keeps every request in its own slot
+    (BGEN): no shared chain, every conversation keeps its slot's cache; the price is the drafts a lone request
+    would have had.  Default true: the path as it has always been (byte-identical)."""
+    raw = (cfg or {}).get("solo_path")
+    if raw is None:
+        return True
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("0", "false", "no", "off", "none")
+    return bool(raw)
+
+
+def zone_of(sampling: dict | None) -> str:
+    """The request's slot zone: a one-shot call (strata_checkpoint false, sent as ckpt=0) is a transient guest;
+    a conversation that later turns extend belongs in the protected slots.  The zone is a property of the
+    request, so a #1994 slot refusal that picks a new slot recomputes the same one: a conversation cannot drift
+    out of the protected slots."""
+    return "guest" if (sampling or {}).get("strata_checkpoint") is False else "protected"
+
+
+def effective_max_context(max_context: int, slot_caps: list[int]) -> int:
+    """The context the server reports and refuses requests against.  With heterogeneous slots (--slot-contexts,
+    INFO slot_caps) --max-context is dead: the widest slot is the largest prompt any slot can take, and the entry
+    check refuses past it so no slot is asked to read a prompt that does not fit.  Homogeneous (no slot_caps):
+    --max-context as before."""
+    return max(slot_caps) if slot_caps else max_context
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -6548,7 +6666,8 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         rc = rp.replica_cfg(cfg, i, groups[i])
         try:
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                      env=child_env(rc), lazy=lazy, cpus=cpus[i] if cpus else None)
+                                      env=child_env(rc), lazy=lazy, cpus=cpus[i] if cpus else None,
+                                      protected_slots=rc.get("protected_slots"), solo_path=rc.get("solo_path"))
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
@@ -6751,7 +6870,8 @@ def main() -> int:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
         else:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                                  env=env, lazy=lazy)
+                                  env=env, lazy=lazy, protected_slots=cfg.get("protected_slots"),
+                                  solo_path=cfg.get("solo_path"))
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],

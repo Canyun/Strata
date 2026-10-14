@@ -1324,6 +1324,11 @@ class StrataEngine:
         if len(f) >= 5 and isinstance(self.last, dict):
             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+            if len(f) >= 7:       # --batch-mtp: the slot's MTP drafts (engine 0.1.45+), as DONE's 7th/8th fields
+                try:
+                    self.last.update(drafts_accepted=int(f[5]), drafts_offered=int(f[6]))
+                except ValueError:
+                    pass          # a field that is not a count (an older/odd line): leave the admission's as they were
 
     def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
@@ -4679,6 +4684,9 @@ def carry_leg(carry: dict, leg: dict) -> None:
     replaces the engine's figures: keep the slot leg's decode time, tokens and prompt figures to add to it."""
     carry["decode_ms"] = carry.get("decode_ms", 0.0) + float(leg.get("decode_ms") or 0.0)
     carry["generated"] = carry.get("generated", 0) + int(leg.get("generated") or 0)
+    for key in ("drafts_offered", "drafts_accepted"):   # the slot leg's MTP drafts join the request's
+        if leg.get(key):
+            carry[key] = carry.get(key, 0) + int(leg[key])
     carry.setdefault("prompt_ms", float(leg.get("prompt_ms") or 0.0))
     if leg.get("prompt_read") is not None:
         carry.setdefault("prompt_read", int(leg["prompt_read"]))
@@ -4690,6 +4698,9 @@ def add_carry(carry: dict, last: dict) -> dict:
     out = {**last, "decode_ms": float(last.get("decode_ms") or 0.0) + carry.get("decode_ms", 0.0),
            "generated": int(last.get("generated") or 0) + carry.get("generated", 0),
            "prompt_ms": max(float(last.get("prompt_ms") or 0.0), carry.get("prompt_ms", 0.0))}
+    for key in ("drafts_offered", "drafts_accepted"):
+        if carry.get(key):
+            out[key] = int(last.get(key) or 0) + int(carry[key])
     if "prompt_read" in carry:
         out["prompt_read"] = carry["prompt_read"]
     return out

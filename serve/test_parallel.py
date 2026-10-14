@@ -280,6 +280,29 @@ class PickSlot(unittest.TestCase):
         e.slot_held[1] = [1, 2, 3]
         self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 1)
 
+    def test_bdone_carries_the_slots_drafts(self):
+        """--batch-mtp: a slot's stream ends at its BDONE, not at the solo DONE, and DONE is where drafts_accepted/
+        drafts_offered were parsed -- so the batch path reported none and the usage line and strata_top's drafts column
+        stayed blank for a request MTP was accelerating.  The engine puts the slot's own accepted/offered on its BDONE
+        (fields 6/7, the same pair DONE carries); they join the figures the way a slot leg's do (accounting under #457)."""
+        e = self.engine(2)
+        e.last = {"generated": 1, "prompt_ms": 5.0}
+        e._apply_bdone(["BDONE", "1", "10", "stop", "200.0", "3", "4"])
+        self.assertEqual((e.last["drafts_accepted"], e.last["drafts_offered"]), (3, 4), e.last)
+        self.assertEqual((e.last["generated"], e.last["decode_ms"]), (10, 200.0), e.last)
+
+    def test_bdone_without_the_drafts_fields_reports_none(self):
+        """An engine built without --batch-mtp leaves the BDONE at its four fields: the drafts stay as they were rather
+        than being invented as 0 of 0, which a reader would take for a drafter that accepts nothing."""
+        e = self.engine(2)
+        e.last = {"generated": 1}
+        e._apply_bdone(["BDONE", "1", "7", "length", "90.0"])
+        self.assertNotIn("drafts_accepted", e.last)
+        self.assertNotIn("drafts_offered", e.last)
+        e.last = {"generated": 1, "drafts_accepted": 2, "drafts_offered": 9}
+        e._apply_bdone(["BDONE", "1", "7", "length", "90.0", "not-a-count", "nope"])   # odd line: keep the admission's
+        self.assertEqual((e.last["drafts_accepted"], e.last["drafts_offered"]), (2, 9), e.last)
+
     def test_slots_view(self):
         e = self.engine(2)
         e.slot_held[1] = [1, 2]

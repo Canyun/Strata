@@ -9607,7 +9607,10 @@ int main(int argc, char** argv) {
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+                                       " batch_groups=" + std::to_string(o.batch_groups) +
+                                       " batch_mtp=" + std::to_string(batch_mtp ? 1 : 0) +
+                                       (batch_mtp ? " batch_mtp_slots=" + std::to_string((int) slot_mtp.size())
+                                        : "")).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -9813,6 +9816,11 @@ int main(int argc, char** argv) {
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
             std::array<int32_t, strata::kernels::kVerifyMaxT> draft{}; ///< the slot's next MTP proposal
             bool draft_ready = false;
+            // --batch-mtp: the proposals this request's slot offered and the target took, over the whole request
+            // (one per window while the slot runs).  `BDONE` reports them as the solo path's `DONE` does, so the
+            // server's drafts (and its /metrics, Prometheus and top) cover the batch path too.  Zero on a slot
+            // of an engine without --batch-mtp, and the server reads 0 offered as "this slot ran no drafts".
+            int64_t drafts_offered = 0, drafts_accepted = 0;
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
             Clock::time_point t0;
@@ -10051,6 +10059,11 @@ int main(int argc, char** argv) {
             for (int a = 0; a < A; ++a) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
+                // the slot's own tally, for its BDONE: every running slot offers one proposal per window, and
+                // the target took keep-1 of them (0 when it picked its own token over the draft)
+                BSlot& sl = bs[(size_t) active[a]];
+                sl.drafts_offered += batch_mtp ? 1 : 0;
+                sl.drafts_accepted += keep[active[a]] - 1;
             }
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
@@ -10062,7 +10075,8 @@ int main(int argc, char** argv) {
                                          "(BDONE nonfinite) and the next request reads its prompt from token 0\n", b,
                                  (long long) pos[first[t]]);
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                    std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                    std::printf("BDONE %d %lld nonfinite %.1f %lld %lld\n", b, (long long) sl.produced, ms,
+                                (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                     sl.active = false;
                     sl.cached = false;
                     sl.checks.clear();
@@ -10079,7 +10093,8 @@ int main(int argc, char** argv) {
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin, ms,
+                                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                         break;
@@ -10220,7 +10235,9 @@ int main(int argc, char** argv) {
                                              "ends (BDONE nonfinite) and the next request reads its prompt from token 0\n",
                                      gi * GS + t, (long long) sl.p);
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld nonfinite %.1f\n", gi * GS + t, (long long) sl.produced, ms);
+                        std::printf("BDONE %d %lld nonfinite %.1f %lld %lld\n", gi * GS + t,
+                                    (long long) sl.produced, ms,
+                                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                         sl.active = false;
                         sl.cached = false;
                         sl.checks.clear();
@@ -10237,7 +10254,9 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f %lld %lld\n", gi * GS + t,
+                                    (long long) sl.produced, fin, ms,
+                                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                         sl.active = false;
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad

@@ -60,18 +60,18 @@ class SlotOwnership(unittest.TestCase):
 
     def test_window_off_leaves_the_old_behaviour(self):
         for asked in (0, "0", None, -5, True):
-            seconds, notes = S.slot_ownership_choice(asked, 4)
+            seconds, notes = S.slot_protect_seconds_choice(asked, 4)
             self.assertEqual(seconds, 0.0)
             self.assertIn("off", notes[0])
 
     def test_window_needs_two_slots(self):
-        seconds, notes = S.slot_ownership_choice(120, 1)
+        seconds, notes = S.slot_protect_seconds_choice(120, 1)
         self.assertEqual(seconds, 0.0)
         self.assertIn("needs", notes[0])
         self.assertIn("parallel", notes[0])
 
     def test_window_written_with_the_pair_it_needs(self):
-        seconds, notes = S.slot_ownership_choice(120, 4)
+        seconds, notes = S.slot_protect_seconds_choice(120, 4)
         self.assertEqual(seconds, 120.0)
         self.assertIn("3 of the 4 slots", notes[0])
         self.assertTrue(any("solo_path" in x for x in notes))
@@ -81,7 +81,7 @@ class SlotOwnership(unittest.TestCase):
         # the mechanism is three keys as one: a window without the partition and the solo path off is half a
         # mechanism (serve/server.py: the solo path takes no slot, a full partition is no partition)
         source = Path(__file__).resolve().parent.parent.joinpath("setup.py").read_text(encoding="utf-8")
-        self.assertIn('cfg["slot_ownership_s"]', source)
+        self.assertIn('cfg["slot_protect_seconds"]', source)
         self.assertIn('cfg["protected_slots"]', source)
         self.assertIn('cfg["solo_path"] = False', source)
 

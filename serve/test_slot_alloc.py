@@ -17,7 +17,7 @@ from serve.server import (  # noqa: E402
     protected_slots_of,
     session_of,
     slot_caps_of,
-    slot_ownership_of,
+    slot_protect_seconds_of,
     zone_of,
 )
 
@@ -401,25 +401,38 @@ class ZoneConfig(unittest.TestCase):
 
 
 class OwnershipConfig(unittest.TestCase):
-    """"slot_ownership_s": how long a slot belongs to the conversation that last used it.  Absent or 0: no
+    """"slot_protect_seconds": how long a slot belongs to the conversation that last used it.  Absent or 0: no
     ownership, every free slot serves every request (the default, byte-identical to the routing before)."""
 
     def test_absent_is_off(self):
-        self.assertEqual(slot_ownership_of({}), 0.0)
-        self.assertEqual(slot_ownership_of({"slot_ownership_s": None}), 0.0)
+        self.assertEqual(slot_protect_seconds_of({}), 0.0)
+        self.assertEqual(slot_protect_seconds_of({"slot_protect_seconds": None}), 0.0)
 
     def test_reads_a_number_and_a_string(self):
-        self.assertEqual(slot_ownership_of({"slot_ownership_s": 120}), 120.0)
-        self.assertEqual(slot_ownership_of({"slot_ownership_s": "120"}), 120.0)
-        self.assertEqual(slot_ownership_of({"slot_ownership_s": 90.5}), 90.5)
+        self.assertEqual(slot_protect_seconds_of({"slot_protect_seconds": 120}), 120.0)
+        self.assertEqual(slot_protect_seconds_of({"slot_protect_seconds": "120"}), 120.0)
+        self.assertEqual(slot_protect_seconds_of({"slot_protect_seconds": 90.5}), 90.5)
 
     def test_off_words_and_zero(self):
         for off in (0, "0", False, "false", "off", "none", ""):
-            self.assertEqual(slot_ownership_of({"slot_ownership_s": off}), 0.0, off)
+            self.assertEqual(slot_protect_seconds_of({"slot_protect_seconds": off}), 0.0, off)
 
     def test_garbage_and_negative_are_off(self):
         for bad in ("abc", -5, True, {"a": 1}):
-            self.assertEqual(slot_ownership_of({"slot_ownership_s": bad}), 0.0, bad)
+            self.assertEqual(slot_protect_seconds_of({"slot_protect_seconds": bad}), 0.0, bad)
+
+    def test_the_former_name_is_read_so_a_renamed_config_does_not_go_off(self):
+        # a setup before the rename wrote "slot_ownership_s": reading only the new name would silently turn the
+        # protection off - the whole reason for the fallback (the same silent-off Bug #1 was about)
+        self.assertEqual(slot_protect_seconds_of({"slot_ownership_s": 120}), 120.0)
+        self.assertEqual(slot_protect_seconds_of({"slot_ownership_s": "90"}), 90.0)
+
+    def test_the_new_name_wins_when_a_config_has_both(self):
+        self.assertEqual(slot_protect_seconds_of({"slot_protect_seconds": 60, "slot_ownership_s": 120}), 60.0)
+
+    def test_the_former_name_off_stays_off(self):
+        self.assertEqual(slot_protect_seconds_of({"slot_ownership_s": 0}), 0.0)
+        self.assertEqual(slot_protect_seconds_of({"slot_ownership_s": "off"}), 0.0)
 
     def test_the_conversation_may_name_itself(self):
         # an agent that rewrites its system prompt mid-session changes its prompt's start and would lose the slot
@@ -451,7 +464,7 @@ class SessionOwnership(unittest.TestCase):
         e.slot_group = [0] * self.BATCH
         e.slot_cap = [0] * self.BATCH
         e.slot_zone = ["protected" if b in self.PROTECTED else "guest" for b in range(self.BATCH)]
-        e.session_ownership_s = ownership_s
+        e.slot_protect_seconds = ownership_s
         e.slot_owner = [None] * self.BATCH
         return e
 
@@ -607,20 +620,20 @@ class SessionOwnership(unittest.TestCase):
 
 
 class SpawnCarriesTheRouting(unittest.TestCase):
-    """"protected_slots", "solo_path" and "slot_ownership_s" ride in spawn: restart() re-runs __init__ with
+    """"protected_slots", "solo_path" and "slot_protect_seconds" ride in spawn: restart() re-runs __init__ with
     *self.spawn and so must the start retry - an engine that comes back without them routes nothing, and a
     conversation silently loses the slot its chain lives in."""
 
     def test_spawn_carries_all_three(self):
         e = StrataEngine("noop", ["--max-context", "4096"], lazy=True,
-                         protected_slots=[0, 1], solo_path=False, slot_ownership_s=120)
+                         protected_slots=[0, 1], solo_path=False, slot_protect_seconds=120)
         self.assertEqual(e.spawn[8:], ([0, 1], False, 120))
 
     def test_a_lazy_engine_can_be_picked_against(self):
         # pick_slot runs against an engine that is restarting: the ownership tables exist from the lazy return,
         # not only after READY (a missing attribute would raise inside a request)
-        e = StrataEngine("noop", ["--max-context", "4096"], lazy=True, slot_ownership_s=120)
-        self.assertEqual(e.session_ownership_s, 120.0)
+        e = StrataEngine("noop", ["--max-context", "4096"], lazy=True, slot_protect_seconds=120)
+        self.assertEqual(e.slot_protect_seconds, 120.0)
         self.assertEqual(e.slot_owner, [])
 
     def test_the_start_retry_passes_the_tail_through(self):
@@ -633,7 +646,7 @@ class SpawnCarriesTheRouting(unittest.TestCase):
 class OwnershipVisible(unittest.TestCase):
     """The panel is how a slot's owner is diagnosed: the fourth conversation not running is invisible unless the
     slots say who holds them.  The server states the fact (who owns the slot, and whether that is inside the
-    window); strata_top decides how to render it.  Without "slot_ownership_s" the view is exactly as it was."""
+    window); strata_top decides how to render it.  Without "slot_protect_seconds" the view is exactly as it was."""
 
     def engine(self, ownership_s):
         e = object.__new__(StrataEngine)
@@ -648,7 +661,7 @@ class OwnershipVisible(unittest.TestCase):
         e.slot_group = [0] * 3
         e.slot_cap = [0] * 3
         e.slot_zone = ["protected", "protected", "guest"]
-        e.session_ownership_s = ownership_s
+        e.slot_protect_seconds = ownership_s
         e.slot_owner = [None] * 3
         return e
 

@@ -5213,8 +5213,8 @@ def protected_slots_default(parallel) -> list[int]:
     return list(range(parallel - 1))
 
 
-def slot_ownership_choice(asked, parallel) -> tuple[float, list[str]]:
-    """What setup says about "slot_ownership_s": the seconds to write (0 = off) and the notes.  A slot belongs to
+def slot_protect_seconds_choice(asked, parallel) -> tuple[float, list[str]]:
+    """What setup says about "slot_protect_seconds": the seconds to write (0 = off) and the notes.  A slot belongs to
     the conversation that last used it for that long, so its next turn finds the chain where it left it instead
     of a neighbour's prompt.  The window is a lease on a live conversation: a conversation beyond the protected
     slots runs only after one has been idle for the whole window, so "parallel" has to be at least as many slots
@@ -5844,7 +5844,7 @@ def main() -> int:
     ap.add_argument("--parallel", type=int, metavar="N",
                     help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
                          "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
-    ap.add_argument("--slot-ownership-s", type=int, metavar="N",
+    ap.add_argument("--slot-protect-seconds", type=int, metavar="N",
                     help="a batch slot belongs to the conversation that last used it for N seconds: its next turn "
                          "returns to the chain in that slot and no other conversation takes the slot meanwhile "
                          "(opt-in; 0/off turns it off). Needs \"protected_slots\" and \"solo_path\": false, "
@@ -6827,17 +6827,17 @@ def main() -> int:
             ok("parallel requests: one at a time (--parallel 1)")
     # the fork's conversation-slot protection: written together, as one mechanism.  A slot a conversation owns
     # only matters for requests that reach a batch slot, so it needs the partition and the solo path off
-    if a.slot_ownership_s is not None:
+    if a.slot_protect_seconds is not None:
         slots_asked = a.parallel if a.parallel is not None else cfg.get("parallel")
-        seconds, notes = slot_ownership_choice(a.slot_ownership_s, slots_asked)
+        seconds, notes = slot_protect_seconds_choice(a.slot_protect_seconds, slots_asked)
         for i, line in enumerate(notes):
             (ok if i == 0 else warn)(line)
         if seconds > 0:
-            cfg["slot_ownership_s"] = seconds
+            cfg["slot_protect_seconds"] = seconds
             cfg["protected_slots"] = protected_slots_default(slots_asked)
             cfg["solo_path"] = False    # the solo path takes no slot: nothing there is owned (serve/server.py)
         else:
-            cfg.pop("slot_ownership_s", None)
+            cfg.pop("slot_protect_seconds", None)
     if vision != "none":
         old_cfg = ROOT / f"strata-{tag.lower()}.json"
         vt = vision_tokens(a.vision_tokens, vision, old_cfg if old_cfg.is_file() else adopted)

@@ -220,7 +220,7 @@ def idle_text(seconds) -> str:
 
 
 def owner_flag(s: dict, window) -> str:
-    """The flags a slot gets for "slot_ownership_s": who owns it, and how much of the window is left on it.  A
+    """The flags a slot gets for "slot_protect_seconds": who owns it, and how much of the window is left on it.  A
     slot that is idle and owned reads "idle free" without this, while it is closed to every conversation but
     its owner - which is why the fourth conversation does not run.  Past the window the slot holds a dead
     conversation and the next one takes it: "stale", the state to see when a chain is about to be rebuilt.
@@ -320,7 +320,7 @@ def slots_panel(m: dict, pal: Palette) -> list[str]:
     if not slots:
         return []
     zones = [s.get("zone") for s in slots if s.get("zone")]
-    window = live.get("slot_ownership_s") or 0
+    window = live.get("slot_protect_seconds") or 0
     busy = sum(1 for s in slots if s.get("state") not in (None, "idle"))
     head = pal.label("slots") + f"{len(slots)}"
     if busy:

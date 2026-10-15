@@ -185,7 +185,7 @@ class OlderServer(unittest.TestCase):
 
 
 class Ownership(unittest.TestCase):
-    """"slot_ownership_s": a slot belongs to a conversation, and the panel is the only place that shows it.  An
+    """"slot_protect_seconds": a slot belongs to a conversation, and the panel is the only place that shows it.  An
     owned slot reads "idle, free" while it is closed to every conversation but its owner - which is what makes
     the fourth conversation not run, and what a user has to be able to see."""
 
@@ -193,7 +193,7 @@ class Ownership(unittest.TestCase):
         """Four slots, a 120 s window: slot 0 runs its conversation, slot 1 holds one idle past the window (its
         chain is dead and the slot is open), slots 2-3 have none.  owners: (key, idle_s) per slot."""
         m = metrics()
-        m["live"]["slot_ownership_s"] = window
+        m["live"]["slot_protect_seconds"] = window
         m["live"]["slot_holders"] = sum(1 for owner in owners
                                         if owner and (owner[1] is None or owner[1] <= window))
         for s, owner in zip(m["live"]["slots"], owners):
@@ -236,7 +236,7 @@ class Ownership(unittest.TestCase):
     def test_no_window_is_the_screen_as_it_was(self):
         # an older server (no owner fields) and an engine with the window off: the flags column is what it was
         m = self.payload(window=0.0, owners=(None, None, None, None))
-        m["live"].pop("slot_ownership_s")
+        m["live"].pop("slot_protect_seconds")
         for row in self.rows(m).values():
             self.assertNotIn("owns", row)
             self.assertNotIn("stale", row)

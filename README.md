@@ -6,10 +6,10 @@
 >
 > - **`protected_slots`**（配置顶层字段）：批次槽位分区。把指定槽位保留给带检查点的常驻会话（`zone="protected"`），一次性调用（`strata_checkpoint: false`，发为 `ckpt=0`）落入其余 `guest` 槽位。二者互不驱逐——常驻会话的缓存不再被过客请求清掉。
 > - **`solo_path`**（配置顶层字段，默认 `true`）：设为 `false` 时，每个请求留在自己的批次槽位（`BGEN`），不再走全进程唯一的 solo 检查点链（`GEN`）。solo 链是赢家通吃的——任何跑过它的请求（含一次性调用）都会覆写常驻会话留下的链，使该会话下一轮从零重读整个 prompt。关掉后每个会话守住自己槽位的缓存。
-> - **`slot_ownership_s`**（配置顶层字段，默认关）：一个批次槽位在 N 秒内**属于**最后使用它的会话。所有权是否决权（不是排序偏好），且**不设 token 门槛**：会话的下一轮回到自己槽位的链（只读新增部分），期间该槽对其它会话关闭；槽被活会话占满时，超出的会话排队等一个窗口。会话可用 `strata_session` 自声明身份（改写 system prompt 的客户端必须声明，否则哈希变、槽丢）。
-> - **槽位淘汰保护**：`pick_slot` 按请求 zone 过滤候选；持有长会话（≥16384 token）且在空闲宽限期（120 秒）内的槽位被锁定。注意这把锁是**排序权重**，全锁时照样给槽——它挡不住 12.7K token 量级的 agent 会话（低于门槛），这正是 `slot_ownership_s` 存在的原因。
+> - **`slot_protect_seconds`**（配置顶层字段，默认关）：一个批次槽位在 N 秒内**属于**最后使用它的会话。所有权是否决权（不是排序偏好），且**不设 token 门槛**：会话的下一轮回到自己槽位的链（只读新增部分），期间该槽对其它会话关闭；槽被活会话占满时，超出的会话排队等一个窗口。会话可用 `strata_session` 自声明身份（改写 system prompt 的客户端必须声明，否则哈希变、槽丢）。
+> - **槽位淘汰保护**：`pick_slot` 按请求 zone 过滤候选；持有长会话（≥16384 token）且在空闲宽限期（120 秒）内的槽位被锁定。注意这把锁是**排序权重**，全锁时照样给槽——它挡不住 12.7K token 量级的 agent 会话（低于门槛），这正是 `slot_protect_seconds` 存在的原因。
 >
-> 三个字段是一套机制，须一起配置：所有权只在请求进入批次槽位时生效，因此需要 `solo_path: false`，并需要 `protected_slots` 留出一个 guest 槽（全保护等于无分区）。`setup.py --slot-ownership-s N` 会一次写全三个。
+> 三个字段是一套机制，须一起配置：所有权只在请求进入批次槽位时生效，因此需要 `solo_path: false`，并需要 `protected_slots` 留出一个 guest 槽（全保护等于无分区）。`setup.py --slot-protect-seconds N` 会一次写全三个。
 >
 > 配置示例：
 >
@@ -18,11 +18,11 @@
 >   "parallel": 4,
 >   "protected_slots": [0, 1, 2],
 >   "solo_path": false,
->   "slot_ownership_s": 120
+>   "slot_protect_seconds": 120
 > }
 > ```
 >
-> 默认值（不设 `protected_slots`、`solo_path: true`、不设 `slot_ownership_s`）与上游行为逐字节一致。测试见 `serve/test_parallel.py`、`serve/test_slot_alloc.py`（路由单元）、`serve/test_slot_ownership.py`（端到端：会话独占槽、超出者排队并收到心跳）。会话数超过受保护槽数时，超出会话的首字延迟会推至一整轮的量级，排队期间每 10 秒发 SSE 心跳（复用 #1619 的 `QUEUE_BEAT_S`）以不被客户端看门狗掐断。本 fork 的性能收益尚在本机 A/B 实测中，未给出数字前不作为结论。
+> 默认值（不设 `protected_slots`、`solo_path: true`、不设 `slot_protect_seconds`）与上游行为逐字节一致。测试见 `serve/test_parallel.py`、`serve/test_slot_alloc.py`（路由单元）、`serve/test_slot_protect.py`（端到端：会话独占槽、超出者排队并收到心跳）。会话数超过受保护槽数时，超出会话的首字延迟会推至一整轮的量级，排队期间每 10 秒发 SSE 心跳（复用 #1619 的 `QUEUE_BEAT_S`）以不被客户端看门狗掐断。本 fork 的性能收益尚在本机 A/B 实测中，未给出数字前不作为结论。
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 

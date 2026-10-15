@@ -545,7 +545,7 @@ def main() -> int:
         epilog="slots: zone = the config's protected_slots partition; cap = the context that slot fits;"
                " LOCKED = a long conversation in its grace, eviction never takes it; idle = seconds since used,"
                " never = a slot the engine has not served yet; drafts = that slot's MTP proposals (accepted/offered,"
-               " and their share; "-" on every row of a --batch-mtp engine is the flag that its drafts are not running)."
+               " and their share; \"-\" on every row of a --batch-mtp engine is the flag that its drafts are not running)."
                " read (in the table) = the prompt tokens read again (0 = a full cache reuse)."
                " A PCIe generation below the card's max is NVML reading the idle link: read the MB/s.")
     ap.add_argument("url", nargs="?", default="http://127.0.0.1:8080")

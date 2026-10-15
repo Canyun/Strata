@@ -3,10 +3,13 @@ guard, the color layer and what an older server's shorter /metrics still renders
 
     python -m unittest tools.test_strata_top
 """
+import contextlib
+import io
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -240,6 +243,34 @@ class Ownership(unittest.TestCase):
         rows = self.rows(m)
         self.assertIn("LOCKED", rows["0"])
         self.assertIn("free", rows["2"])
+
+
+class Cli(unittest.TestCase):
+    """main() builds its ArgumentParser before it parses anything: 001ab0e wrote a quoted "-" between two
+    adjacent epilog literals, which Python reads as str - str, and every call - --help, the panel, --once -
+    died with a TypeError before doing anything.  A screen the user cannot start is the bug the panel's own
+    tests (render on a dict) never see, so the entry point itself is what gets tested here."""
+
+    def run_cli(self, argv):
+        """main() with sys.argv set: the help exits 0 through SystemExit, and the TypeError (the bug) escapes."""
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["strata_top.py"] + argv), contextlib.redirect_stdout(out):
+            try:
+                code = ST.main()
+            except SystemExit as e:               # --help: print, exit 0
+                code = e.code
+        return code, out.getvalue()
+
+    def test_the_entry_point_starts_and_its_help_shows_the_legend(self):
+        code, out = self.run_cli(["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("drafts = that slot", " ".join(out.split()))
+
+    def test_the_epilog_keeps_its_hyphen_literal(self):
+        # the drafts legend quotes the "-" a row shows: it has to survive into the printed help.  argparse
+        # wraps the epilog at word boundaries at any width, so the phrase is matched with the wrap flattened.
+        code, out = self.run_cli(["--help"])
+        self.assertIn('"-" on every row', " ".join(out.split()))
 
 
 if __name__ == "__main__":

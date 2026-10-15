@@ -15,7 +15,9 @@ from serve.server import (  # noqa: E402
     StrataEngine,
     effective_max_context,
     protected_slots_of,
+    session_of,
     slot_caps_of,
+    slot_ownership_of,
     zone_of,
 )
 
@@ -336,9 +338,26 @@ class ZoneConfig(unittest.TestCase):
     server's own slots, and the engine takes any free slot BGEN names, so it never reaches the engine's
     command line (an unknown argument there exits the engine)."""
 
+    @staticmethod
+    def zones_said(batch, cfg):
+        """protected_slots_of's zones and what it printed - a config that asks for a partition and does not get
+        one is the silent failure: the conversation's chain is evicted and the log says nothing about why."""
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            zones = protected_slots_of(batch, cfg)
+        return zones, buf.getvalue()
+
     def test_reads_the_config_list(self):
         self.assertEqual(protected_slots_of(4, {"protected_slots": [0, 1, 2]}),
                          ["protected", "protected", "protected", "guest"])
+
+    def test_a_partition_that_takes_says_nothing(self):
+        # a working config is not chatty: only a partition the user asked for and did not get is worth a line
+        zones, said = self.zones_said(4, {"protected_slots": [0, 1, 2]})
+        self.assertEqual(zones, ["protected", "protected", "protected", "guest"])
+        self.assertEqual(said, "")
 
     def test_accepts_a_comma_string(self):
         self.assertEqual(protected_slots_of(4, {"protected_slots": "0,1,2"}),
@@ -348,13 +367,319 @@ class ZoneConfig(unittest.TestCase):
         self.assertEqual(protected_slots_of(4, {}), [])
         self.assertEqual(protected_slots_of(4, {"protected_slots": []}), [])
 
+    def test_a_slot_past_the_engines_says_so(self):
+        # the engine reports fewer slots than the config was written for (a layer split, a --fit cap): the slots
+        # past it are dropped, and the user has to be told the partition is not what they wrote
+        zones, said = self.zones_said(4, {"protected_slots": [0, 1, 9]})
+        self.assertEqual(zones, ["protected", "protected", "guest", "guest"])
+        self.assertIn("protected_slots", said)
+        self.assertIn("9", said)
+
+    def test_slots_past_every_slot_leave_no_partition_and_say_so(self):
+        # "parallel" 2 with protected [5]: every asked slot is out of range and the partition closes; closing it
+        # silently left a conversation rebuilt by a guest turn with nothing in the log to trace
+        zones, said = self.zones_said(2, {"protected_slots": [5]})
+        self.assertEqual(zones, [])
+        self.assertIn("protected_slots", said)
+        self.assertIn("no partition", said)
+
+    def test_every_slot_protected_is_no_partition_and_says_so(self):
+        # all slots protected = the default routing: a partition that constrains nothing is not said to be on,
+        # and the config that asked for it is told (the engine reporting fewer slots than the config reaches
+        # this through the same door: [0,1,2] asked, batch 2 left)
+        zones, said = self.zones_said(4, {"protected_slots": [0, 1, 2, 3]})
+        self.assertEqual(zones, [])
+        self.assertIn("protected_slots", said)
+        self.assertIn("no partition", said)
+        zones, said = self.zones_said(2, {"protected_slots": [0, 1, 2]})
+        self.assertEqual(zones, [])
+        self.assertIn("no partition", said)
+
     def test_out_of_range_and_duplicates_are_dropped(self):
         self.assertEqual(protected_slots_of(4, {"protected_slots": [0, 0, 9, -1]}),
                          ["protected", "guest", "guest", "guest"])
 
-    def test_every_slot_protected_is_no_partition(self):
-        # all slots protected = the default routing: a partition that constrains nothing is not said to be on
-        self.assertEqual(protected_slots_of(4, {"protected_slots": [0, 1, 2, 3]}), [])
+
+class OwnershipConfig(unittest.TestCase):
+    """"slot_ownership_s": how long a slot belongs to the conversation that last used it.  Absent or 0: no
+    ownership, every free slot serves every request (the default, byte-identical to the routing before)."""
+
+    def test_absent_is_off(self):
+        self.assertEqual(slot_ownership_of({}), 0.0)
+        self.assertEqual(slot_ownership_of({"slot_ownership_s": None}), 0.0)
+
+    def test_reads_a_number_and_a_string(self):
+        self.assertEqual(slot_ownership_of({"slot_ownership_s": 120}), 120.0)
+        self.assertEqual(slot_ownership_of({"slot_ownership_s": "120"}), 120.0)
+        self.assertEqual(slot_ownership_of({"slot_ownership_s": 90.5}), 90.5)
+
+    def test_off_words_and_zero(self):
+        for off in (0, "0", False, "false", "off", "none", ""):
+            self.assertEqual(slot_ownership_of({"slot_ownership_s": off}), 0.0, off)
+
+    def test_garbage_and_negative_are_off(self):
+        for bad in ("abc", -5, True, {"a": 1}):
+            self.assertEqual(slot_ownership_of({"slot_ownership_s": bad}), 0.0, bad)
+
+    def test_the_conversation_may_name_itself(self):
+        # an agent that rewrites its system prompt mid-session changes its prompt's start and would lose the slot
+        # its chain lives in; "strata_session" keeps it by its own id
+        self.assertEqual(session_of({"strata_session": "task-42"}), "task-42")
+        self.assertIsNone(session_of({}))
+        self.assertIsNone(session_of({"strata_session": ""}))
+        self.assertIsNone(session_of(None))
+
+
+class SessionOwnership(unittest.TestCase):
+    """A slot belongs to the conversation that holds its chain until the ownership grace passes.  The lock of
+    the eviction ordering is a weight and needs 16384 held tokens; a 12.7K agent conversation reaches neither,
+    so its chain was rebuilt by a neighbour every turn.  Ownership is a veto: with every slot owned by a live
+    conversation the pick queues (None) rather than evicting, and it asks no token floor."""
+
+    BATCH, PROTECTED = 4, [0, 1, 2]
+    APPENDED = 80      # the tokens one turn adds to its conversation's start
+
+    def engine(self, ownership_s):
+        e = object.__new__(StrataEngine)
+        e.batch = self.BATCH
+        e.slot_order = list(range(self.BATCH))
+        e.slot_busy = [False] * self.BATCH
+        e.slot_held = [[] for _ in range(self.BATCH)]
+        e.slot_used = [0.0] * self.BATCH
+        e.slot_gs = 0
+        e.slot_groups = 1
+        e.slot_group = [0] * self.BATCH
+        e.slot_cap = [0] * self.BATCH
+        e.slot_zone = ["protected" if b in self.PROTECTED else "guest" for b in range(self.BATCH)]
+        e.session_ownership_s = ownership_s
+        e.slot_owner = [None] * self.BATCH
+        return e
+
+    def prompt(self, session, turn=0, tokens=12692):
+        """A conversation's prompt: a start every later turn carries, plus what this turn appends.  Every
+        appended token carries the turn number, so the shared prefix of two turns is exactly the start."""
+        return [1000 + session] * tokens + [7000 + session + turn] * self.APPENDED
+
+    def claim(self, e, slot, prompt, at, skey=None):
+        """What an admission and its BDONE leave behind: the tokens the slot now holds, the time it was last
+        used, and the conversation that owns it; the slot itself is free for the next turn."""
+        e.slot_held[slot] = list(prompt)
+        e.slot_used[slot] = at
+        e.slot_owner[slot] = e._session_key(prompt, skey)
+
+    def turn(self, e, session, slot, at, skey=None):
+        """One turn of a conversation: the pick, the slot busy while it runs, the chain it leaves."""
+        prompt = self.prompt(session)
+        self.assertEqual(e.pick_slot(prompt, "protected", skey), slot)
+        e.slot_busy[slot] = True
+        self.claim(e, slot, prompt, at, skey)
+        e.slot_busy[slot] = False
+        return prompt
+
+    def fill(self, e, at):
+        """Every protected slot owned by its own live conversation."""
+        for s in self.PROTECTED:
+            self.turn(e, s, s, at)
+
+    def test_off_is_the_old_routing(self):
+        # 6 conversations over 3 protected slots, ownership off: every one of them gets a slot, so each slot
+        # serves several conversations and rebuilds the chain of the one it displaced
+        e = self.engine(0.0)
+        now = time.time()
+        seen = {}
+        for session in range(6):
+            slot = e.pick_slot(self.prompt(session), "protected")
+            self.assertIsNotNone(slot, session)
+            seen.setdefault(slot, set()).add(session)
+            self.claim(e, slot, self.prompt(session), now)
+        self.assertGreater(max(len(v) for v in seen.values()), 1, seen)
+
+    def test_the_first_conversations_take_the_empty_slots(self):
+        e = self.engine(120.0)
+        now = time.time()
+        for s in self.PROTECTED:
+            self.assertEqual(e.pick_slot(self.prompt(s), "protected"), s)
+            self.claim(e, s, self.prompt(s), now)
+        self.assertIsNone(e.pick_slot(self.prompt(3), "protected"))
+
+    def test_a_fourth_conversation_queues_rather_than_taking_an_owned_slot(self):
+        e = self.engine(120.0)
+        self.fill(e, time.time())
+        self.assertIsNone(e.pick_slot(self.prompt(3), "protected"))
+        self.assertIsNone(e.pick_slot(self.prompt(4), "protected"))
+
+    def test_a_turn_returns_to_its_own_slot_and_its_own_chain(self):
+        e = self.engine(120.0)
+        self.turn(e, 0, 0, time.time())
+        again = self.prompt(0, turn=1)
+        slot = e.pick_slot(again, "protected")
+        self.assertEqual(slot, 0)
+        held = e.slot_held[0]
+        shared = 0
+        while shared < min(len(held), len(again)) and held[shared] == again[shared]:
+            shared += 1
+        self.assertEqual(shared, len(again) - self.APPENDED)   # the chain covers all but this turn's own tokens
+
+    def test_the_same_conversation_shares_its_slot_only_with_itself(self):
+        # its slot is taken by its running turn: a second request of the same conversation waits for it, and a
+        # conversation of its own takes a slot nobody owns - never the busy one
+        e = self.engine(120.0)
+        e.slot_busy[0] = True
+        self.claim(e, 0, self.prompt(0), time.time())
+        self.assertIsNone(e.pick_slot(self.prompt(0), "protected"))
+        self.assertEqual(e.pick_slot(self.prompt(1), "protected"), 1)
+
+    def test_no_token_floor(self):
+        # 12,692 tokens is the size a real agent conversation measured on the panel; the eviction lock's 16384
+        # floor left every conversation of that size unguarded, turn after turn
+        e = self.engine(120.0)
+        now = time.time()
+        for s in self.PROTECTED:
+            self.turn(e, s, s, now, )
+        self.assertLess(len(e.slot_held[0]), StrataEngine.SLOT_PROTECT_MIN_TOKENS)
+        self.assertFalse(e._slot_locked(0))                    # the lock of the ordering: off at this size
+        self.assertIsNone(e.pick_slot(self.prompt(3, tokens=12692), "protected"))   # ownership: guards it
+
+    def test_a_slot_whose_owner_went_idle_past_the_grace_is_taken(self):
+        e = self.engine(120.0)
+        now = time.time()
+        self.fill(e, now)
+        e.slot_used[0] = now - 121.0                           # 121 s idle: the conversation is gone
+        self.assertEqual(e.pick_slot(self.prompt(3), "protected"), 0)
+
+    def test_just_inside_the_grace_still_holds(self):
+        e = self.engine(120.0)
+        now = time.time()
+        self.fill(e, now)
+        e.slot_used[0] = now - 119.0
+        self.assertIsNone(e.pick_slot(self.prompt(3), "protected"))
+
+    def test_the_owner_keeps_its_slot_while_its_turn_runs(self):
+        e = self.engine(120.0)
+        self.fill(e, time.time())
+        e.slot_busy[2] = True
+        self.assertIsNone(e.pick_slot(self.prompt(2), "protected"))   # its own slot is busy: it waits, no second copy
+
+    def test_bdone_frees_the_slot_and_keeps_the_owner(self):
+        e = self.engine(120.0)
+        now = time.time()
+        self.turn(e, 0, 0, now)
+        self.assertFalse(e.slot_busy[0])
+        self.assertEqual(e.slot_owner[0], e._session_key(self.prompt(0)))
+
+    def test_an_explicit_session_survives_a_changed_prompt_start(self):
+        # the client rewrote its system prompt: the digest of the start moved, "strata_session" did not
+        e = self.engine(120.0)
+        now = time.time()
+        mine = self.prompt(0)
+        slot = e.pick_slot(mine, "protected", "task-42")
+        self.claim(e, slot, mine, now, "task-42")
+        rewritten = [555] * 9000 + mine                        # a new start, the same conversation
+        self.assertEqual(e.pick_slot(rewritten, "protected", "task-42"), slot)
+        # unnamed, the rewritten start is a new conversation: it takes a slot nobody owns and loses the chain,
+        # which is why a client that edits its prompt has to name its session
+        self.assertEqual(e.pick_slot(rewritten, "protected"), 1)
+
+    def test_the_guest_zone_never_owns_a_slot(self):
+        # a one-shot call has no chain to keep: it takes no protected slot and owns nothing when it lands
+        e = self.engine(120.0)
+        self.fill(e, time.time())
+        self.assertEqual(e.pick_slot([1, 2, 3], "guest"), 3)
+        self.assertIsNone(e.slot_owner[3])
+        self.assertEqual(e.pick_slot([4, 5, 6], "guest"), 3)   # the next one-shot takes it as freely
+
+    def test_a_guest_never_takes_a_protected_slot(self):
+        e = self.engine(120.0)
+        self.turn(e, 0, 0, time.time())
+        self.assertIsNone(e.pick_slot(self.prompt(3), "guest")) if self.PROTECTED == [0] else None
+        self.assertEqual(e.pick_slot(self.prompt(3), "guest"), 3)
+
+    def test_the_key_of_two_conversations_differs(self):
+        e = self.engine(120.0)
+        self.assertNotEqual(e._session_key(self.prompt(0)), e._session_key(self.prompt(1)))
+        self.assertEqual(e._session_key(self.prompt(0)), e._session_key(self.prompt(0, turn=1)))
+
+    def test_the_key_ignores_what_a_turn_appends(self):
+        # the start is what identifies a conversation: 512 tokens of it is far past the system prompt and the
+        # first turns, and every later turn carries them unchanged
+        e = self.engine(120.0)
+        self.assertEqual(e._session_key(self.prompt(0, tokens=12692)), e._session_key(self.prompt(0, tokens=90000)))
+
+
+class SpawnCarriesTheRouting(unittest.TestCase):
+    """"protected_slots", "solo_path" and "slot_ownership_s" ride in spawn: restart() re-runs __init__ with
+    *self.spawn and so must the start retry - an engine that comes back without them routes nothing, and a
+    conversation silently loses the slot its chain lives in."""
+
+    def test_spawn_carries_all_three(self):
+        e = StrataEngine("noop", ["--max-context", "4096"], lazy=True,
+                         protected_slots=[0, 1], solo_path=False, slot_ownership_s=120)
+        self.assertEqual(e.spawn[8:], ([0, 1], False, 120))
+
+    def test_a_lazy_engine_can_be_picked_against(self):
+        # pick_slot runs against an engine that is restarting: the ownership tables exist from the lazy return,
+        # not only after READY (a missing attribute would raise inside a request)
+        e = StrataEngine("noop", ["--max-context", "4096"], lazy=True, slot_ownership_s=120)
+        self.assertEqual(e.session_ownership_s, 120.0)
+        self.assertEqual(e.slot_owner, [])
+
+    def test_the_start_retry_passes_the_tail_through(self):
+        # a dropped positional tail is a silent routing loss, and only a start retry (a GPU runtime that was not
+        # ready, START_RETRIES) takes this path - no test harness reaches it without a GPU
+        source = Path(__file__).resolve().parents[1].joinpath("serve/server.py").read_text(encoding="utf-8")
+        self.assertIn("_attempt + 1, *self.spawn[8:]", source)
+
+
+class OwnershipVisible(unittest.TestCase):
+    """The panel is how a slot's owner is diagnosed: the fourth conversation not running is invisible unless the
+    slots say who holds them.  The server states the fact (who owns the slot, and whether that is inside the
+    window); strata_top decides how to render it.  Without "slot_ownership_s" the view is exactly as it was."""
+
+    def engine(self, ownership_s):
+        e = object.__new__(StrataEngine)
+        e.batch = 3
+        e.slot_order = list(range(3))
+        e.slot_busy = [False] * 3
+        e.slot_held = [[] for _ in range(3)]
+        e.slot_used = [0.0] * 3
+        e.slot_live = [None] * 3
+        e.slot_gs = 0
+        e.slot_groups = 1
+        e.slot_group = [0] * 3
+        e.slot_cap = [0] * 3
+        e.slot_zone = ["protected", "protected", "guest"]
+        e.session_ownership_s = ownership_s
+        e.slot_owner = [None] * 3
+        return e
+
+    def test_no_window_adds_nothing_to_the_view(self):
+        e = self.engine(0.0)
+        e.slot_owner[0] = "s:conv-0"           # a stale table with the window off must not leak into the view
+        v = e.slots_view()
+        self.assertNotIn("owner", v[0])
+        self.assertNotIn("owned", v[0])
+        self.assertEqual(v[0], {"slot": 0, "state": "idle", "held_tokens": 0, "zone": "protected",
+                                "cap": 0, "locked": False, "idle_s": v[0]["idle_s"]}, v[0])
+
+    def test_the_view_says_who_holds_each_slot(self):
+        now = time.time()
+        e = self.engine(120.0)
+        e.slot_owner[0], e.slot_used[0] = "s:conv-0", now
+        e.slot_owner[1], e.slot_used[1] = "s:conv-1", now - 300.0     # past the window: a dead conversation
+        v = e.slots_view()
+        self.assertEqual((v[0]["owner"], v[0]["owned"]), ("s:conv-0", True), v[0])
+        self.assertEqual((v[1]["owner"], v[1]["owned"]), ("s:conv-1", False), v[1])
+        self.assertEqual((v[2]["owner"], v[2]["owned"]), (None, False), v[2])
+
+    def test_a_running_turn_owns_its_slot(self):
+        e = self.engine(120.0)
+        e.slot_owner[0] = "s:conv-0"
+        e.slot_used[0] = time.time()
+        e.slot_busy[0] = True
+        e.slot_live[0] = {"slot": 0, "state": "decoding", "prompt_tokens": 9, "generated": 4,
+                          "started": time.time() - 2, "first_token": time.time() - 1}
+        v = e.slots_view()
+        self.assertEqual((v[0]["state"], v[0]["owner"], v[0]["owned"]), ("decoding", "s:conv-0", True), v[0])
 
 
 if __name__ == "__main__":

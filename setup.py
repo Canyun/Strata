@@ -5204,6 +5204,40 @@ def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: st
     return lines
 
 
+def protected_slots_default(parallel) -> list[int]:
+    """The partition that goes with slot ownership: every slot but one keeps a conversation's chain, the last
+    serves the one-shot calls (a classification, a probe) that evict nothing.  All slots protected would be no
+    partition at all (serve/server.py's protected_slots_of), which is why one slot is left out."""
+    if not isinstance(parallel, int) or isinstance(parallel, bool) or parallel < 2:
+        return []
+    return list(range(parallel - 1))
+
+
+def slot_ownership_choice(asked, parallel) -> tuple[float, list[str]]:
+    """What setup says about "slot_ownership_s": the seconds to write (0 = off) and the notes.  A slot belongs to
+    the conversation that last used it for that long, so its next turn finds the chain where it left it instead
+    of a neighbour's prompt.  The window is a lease on a live conversation: a conversation beyond the protected
+    slots runs only after one has been idle for the whole window, so "parallel" has to be at least as many slots
+    as the conversations that run at once."""
+    seconds = float(asked) if isinstance(asked, (int, float)) and not isinstance(asked, bool) else 0.0
+    slots = parallel if isinstance(parallel, int) and not isinstance(parallel, bool) else 0
+    if seconds <= 0:
+        return 0.0, ["slot ownership: off - a free slot serves any request, as before"]
+    if slots < 2:
+        return 0.0, ['slot ownership: left off - it needs "parallel" of 2 or more (a single slot cannot be owned: '
+                     "every other request would wait for the window)"]
+    keep = slots - 1
+    lines = [f"slot ownership: {seconds:.0f} s - {keep} of the {slots} slots belong to the conversation that last "
+             f"used them, {slots - keep} serves the one-shot calls (a conversation's next turn reads only what is "
+             "new; its slot is closed to the others meanwhile)"]
+    lines.append(f"{keep} conversations run at once: a conversation beyond them starts only after one has been idle "
+                 f"for the full {seconds:.0f} s, so \"parallel\" should be at least the conversations you run "
+                 "together")
+    lines.append('needs "solo_path": false (a request that runs on the solo path takes no slot and is not owned) - '
+                 'setup writes it with the window')
+    return seconds, lines
+
+
 PREFILL_BIG_RAM_GB = 96        # bench #433 #440 #834 #669: --prefill auto:32768 +21-35% at 96 GB, ~3x slower at 32 GB
 PREFILL_RISK_RAM_GB = 64       # below this an explicit auto:32768 is warned about
 HEADROOM_RAM_GB = 48           # bench #834: STRATA_RESIDENT_HEADROOM_GIB=6 on a PC with this much RAM or less
@@ -5810,6 +5844,11 @@ def main() -> int:
     ap.add_argument("--parallel", type=int, metavar="N",
                     help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
                          "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
+    ap.add_argument("--slot-ownership-s", type=int, metavar="N",
+                    help="a batch slot belongs to the conversation that last used it for N seconds: its next turn "
+                         "returns to the chain in that slot and no other conversation takes the slot meanwhile "
+                         "(opt-in; 0/off turns it off). Needs \"protected_slots\" and \"solo_path\": false, "
+                         "which setup writes together with it")
     ap.add_argument("--replicas", type=int, metavar="N",
                     help="several GPUs: run N independent engines, each on its own equal group of the chosen cards (2 "
                          "replicas on 4 cards = two 2-card engines), requests spread over them (opt-in; more total "
@@ -6786,6 +6825,19 @@ def main() -> int:
         else:
             cfg["parallel"] = 1
             ok("parallel requests: one at a time (--parallel 1)")
+    # the fork's conversation-slot protection: written together, as one mechanism.  A slot a conversation owns
+    # only matters for requests that reach a batch slot, so it needs the partition and the solo path off
+    if a.slot_ownership_s is not None:
+        slots_asked = a.parallel if a.parallel is not None else cfg.get("parallel")
+        seconds, notes = slot_ownership_choice(a.slot_ownership_s, slots_asked)
+        for i, line in enumerate(notes):
+            (ok if i == 0 else warn)(line)
+        if seconds > 0:
+            cfg["slot_ownership_s"] = seconds
+            cfg["protected_slots"] = protected_slots_default(slots_asked)
+            cfg["solo_path"] = False    # the solo path takes no slot: nothing there is owned (serve/server.py)
+        else:
+            cfg.pop("slot_ownership_s", None)
     if vision != "none":
         old_cfg = ROOT / f"strata-{tag.lower()}.json"
         vt = vision_tokens(a.vision_tokens, vision, old_cfg if old_cfg.is_file() else adopted)

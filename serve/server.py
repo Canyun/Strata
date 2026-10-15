@@ -769,11 +769,12 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
-                 protected_slots: list[int] | str | None = None, solo_path: bool | str | None = None):
+                 protected_slots: list[int] | str | None = None, solo_path: bool | str | None = None,
+                 slot_ownership_s: float | int | str | None = None):
         # protected_slots rides in spawn: restart() runs __init__(*self.spawn), so a partition a live engine loses
         # on a crash-restart would silently drop the guest zone and let one-shot calls evict conversations.
         # The 0 is _attempt: a restart starts its try count over (and the tuple is positional, so it must be here).
-        self.spawn = (exe, list(args), cwd, log, env, False, cpus, 0, protected_slots, solo_path)
+        self.spawn = (exe, list(args), cwd, log, env, False, cpus, 0, protected_slots, solo_path, slot_ownership_s)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -793,6 +794,10 @@ class StrataEngine:
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
             self.info["version"] = None
+        # a lazy engine is built before READY and pick_slot may run against a restarted one: the ownership
+        # tables exist from here, filled with their defaults, and set for real below (as slot_zone is)
+        self.session_ownership_s = slot_ownership_of({"slot_ownership_s": slot_ownership_s})
+        self.slot_owner: list = []
         if lazy:
             return
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
@@ -878,7 +883,10 @@ class StrataEngine:
                           f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
                           flush=True)
                 time.sleep(wait_s)
-                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1)
+                # self.spawn[8:] carries the routing settings (the partition, the solo path, the ownership
+                # window): a retry that drops them starts an engine that routes nothing - a conversation
+                # silently loses the slot its chain lives in (restart() keeps them; a retry must too)
+                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1, *self.spawn[8:])
                 return
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
                    "the engine exited before it was ready")
@@ -944,6 +952,10 @@ class StrataEngine:
         # the rest, which serve the one-shot calls.  The server's routing decides it; the engine names a free
         # slot in BGEN and does not know zones exist, so it is a config setting, never an engine argument.
         self.slot_zone = protected_slots_of(self.batch, {"protected_slots": protected_slots})
+        # "slot_ownership_s": the slot each conversation owns (its chain lives there).  Set at an admission,
+        # kept at BDONE: the slot is free for the next turn and closed to every other conversation until the
+        # grace passes, which is what keeps a conversation's chain in one place (see pick_slot).
+        self.slot_owner = [None] * self.batch
         # "solo_path": false in the config keeps every request in a batch slot, off the solo path (see solo_path_of)
         self.solo_path = solo_path_of({"solo_path": solo_path})
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
@@ -1514,6 +1526,7 @@ class StrataEngine:
         # It is computed once: every pick_slot below - the #1994 refusal that picks a new slot as well - uses the
         # same zone, so a conversation never drifts into the guest slots and a guest never takes its chain.
         zone = zone_of(sampling)
+        skey = session_of(sampling)   # "strata_session": the id a conversation keeps its owned slot by
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1529,6 +1542,7 @@ class StrataEngine:
         stop_sent = False
         yields, solo_again, refused = 0, 0, 0
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
+        admit_beat = time.monotonic()    # the last heartbeat sent while queued for a slot (see SLOT_QUEUE_BEAT_S)
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -1554,7 +1568,7 @@ class StrataEngine:
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt, zone)
+                                reserved = self.pick_slot(prompt, zone, skey)
                                 if reserved is not None:
                                     self.slot_busy[reserved] = True
                                     self.slot_claims.add(reserved)
@@ -1602,7 +1616,7 @@ class StrataEngine:
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
                         while True:
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt, zone)
+                                slot = self.pick_slot(prompt, zone, skey)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
@@ -1617,7 +1631,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt, zone) is None:
+                                if self.pick_slot(prompt, zone, skey) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
@@ -1628,8 +1642,20 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt, zone) is None:
+                                if self.pick_slot(prompt, zone, skey) is None:
                                     self.slot_cv.wait(timeout=1.0)
+                            if slot is None and time.monotonic() - admit_beat >= QUEUE_BEAT_S:
+                                # a request queued for a slot waits with the control lines given back, so it yields
+                                # no heartbeat of its own: _take_control has one and this path had none.  It is the
+                                # path "slot_ownership_s" makes real - a conversation beyond the protected slots,
+                                # or a second request of a conversation whose own turn is running, waits a whole
+                                # turn (16-21 s measured on the panel's numbers) - past the idle watchdogs of agent
+                                # clients.  The None is the heartbeat the HTTP layer already turns into an SSE
+                                # comment, and here it holds no control lines, so the wait cannot block anybody.
+                                # #1619's QUEUE_BEAT_S is this request's wait for the single turn: same situation,
+                                # same keep-alive, so the same constant.
+                                admit_beat = time.monotonic()
+                                yield None
                             if cancel.is_set():
                                 return
                             if not holding:
@@ -1658,6 +1684,7 @@ class StrataEngine:
                     self._last_done = None                  # (#879: this admission's DONE decides below)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
+                    self._note_owner(slot, prompt, zone, skey)   # the slot is this conversation's from here
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
@@ -1831,6 +1858,7 @@ class StrataEngine:
     SLOT_PREFIX_MIN = 512   # a shared prefix shorter than this is not worth unbalancing the pipeline's groups
     SLOT_PROTECT_MIN_TOKENS = 16384        # a slot holding at least this many tokens is a conversation worth locking
     SLOT_PROTECT_IDLE_GRACE_S = 120.0      # ... and used within this idle window; past it the conversation is dead
+    SESSION_KEY_TOKENS = 512   # the start of a prompt: what every later turn of a conversation carries unchanged
 
     def _slot_locked(self, slot: int) -> bool:
         """A slot is locked while it holds a long conversation used within the idle grace: the pick orders it after
@@ -1841,15 +1869,51 @@ class StrataEngine:
         idle_s = time.time() - self.slot_used[slot]
         return held_tokens >= self.SLOT_PROTECT_MIN_TOKENS and idle_s < self.SLOT_PROTECT_IDLE_GRACE_S
 
-    def pick_slot(self, prompt: list[int], zone: str = "protected") -> int | None:
+    def _session_key(self, prompt: list[int], skey: str | None = None) -> str:
+        """Who a prompt belongs to: the request's own "strata_session" when it names one, else a digest of the
+        prompt's start - the system prompt and the first turns, which every later turn of a conversation carries
+        unchanged.  The digest is over a window (not the whole prompt) so a turn's appended tokens do not move a
+        conversation to another slot; naming the session is how a client that rewrites its system prompt keeps
+        the slot its chain lives in."""
+        if isinstance(skey, str) and skey.strip():
+            return "s:" + skey.strip()
+        window = prompt[:self.SESSION_KEY_TOKENS]
+        return "p:" + hashlib.blake2b(repr(window).encode("utf-8"), digest_size=16).hexdigest()
+
+    def _slot_owned_live(self, slot: int, now: float) -> bool:
+        """A slot is owned while its conversation used it within the ownership grace.  Past the grace it holds a
+        dead conversation and the next conversation takes it (the pick, and the panel's flag)."""
+        owners = getattr(self, "slot_owner", None)
+        grace = getattr(self, "session_ownership_s", 0.0)
+        return (grace > 0 and owners is not None and owners[slot] is not None
+                and now - self.slot_used[slot] <= grace)
+
+    def _note_owner(self, slot: int, prompt: list[int], zone: str, skey: str | None = None) -> None:
+        """The admission takes the slot for its conversation.  The owner is not cleared at BDONE: the slot stays
+        the conversation's for the grace, which is what brings its next turn back to the chain in it.  A guest
+        (one-shot) call owns nothing: its slot is the next free one, as before."""
+        owners = getattr(self, "slot_owner", None)
+        if owners is not None and getattr(self, "session_ownership_s", 0.0) and zone == "protected":
+            owners[slot] = self._session_key(prompt, skey)
+
+    def pick_slot(self, prompt: list[int], zone: str = "protected", skey: str | None = None) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): only slots in the request's zone and wide enough
-        for it, ordered by the tokens they share with the prompt's start (the longest first: the engine reads only
-        the rest), then unlocked before locked, then the smallest capacity that fits (best-fit: keep the wide slots
-        for the conversations that need them), then the least recently used.  Sharing a prefix is a preference and
-        so is the lock, never a requirement: a slot that shares nothing is still taken, because refusing it queues
-        the request until some other conversation ends - and the queued request is usually the next turn of one of
-        the conversations holding those very slots.  None: every slot in the zone is busy, or none is wide enough
-        (a slot's capacity never grows, and a conversation never crosses into the guest slots)."""
+        for it.
+
+        With "slot_ownership_s" the pick is a veto, not a preference: a conversation keeps the slot its chain
+        lives in for the grace, and a request whose chain sits in a busy slot queues for it rather than reading
+        a second copy of its prompt in a neighbour's slot (which is what evicted the neighbour, turn after turn,
+        and rebuilt both conversations from token 0).  The lock of the ordering below is a weight and asks
+        SLOT_PROTECT_MIN_TOKENS, which a 12.7K-token agent conversation never reaches; ownership asks no floor.
+
+        Without it (the default, byte-identical): the slots are ordered by the tokens they share with the
+        prompt's start (the longest first: the engine reads only the rest), then unlocked before locked, then the
+        smallest capacity that fits (best-fit: keep the wide slots for the conversations that need them), then the
+        least recently used.  Sharing a prefix is a preference and so is the lock, never a requirement: a slot
+        that shares nothing is still taken, because refusing it queues the request until some other conversation
+        ends - and the queued request is usually the next turn of one of the conversations holding those slots.
+        None: every slot in the zone is busy, none is wide enough, or (ownership) the zone is full of live
+        conversations."""
         cap = getattr(self, "slot_cap", None)
         zones = getattr(self, "slot_zone", None)
         need = len(prompt)
@@ -1858,6 +1922,38 @@ class StrataEngine:
                 and (not zones or zones[b] == zone)
                 and (not cap or cap[b] <= 0 or cap[b] >= need)]
         if not free:
+            return None
+
+        def shared_prefix(b):
+            """How many leading tokens this slot and the prompt have in common.  What the engine can reuse is its
+            own decision (it answers with RESUME), so the server only ranks the candidates: a slot holding part of
+            the prompt's start is the best of them, and the rest is read again."""
+            h = self.slot_held[b]
+            n = min(len(h), len(prompt))
+            i = 0
+            while i < n and h[i] == prompt[i]:
+                i += 1
+            return i
+
+        owners = getattr(self, "slot_owner", None)
+        grace = getattr(self, "session_ownership_s", 0.0)
+        if owners is not None and grace and zone == "protected":
+            now = time.time()
+            key = self._session_key(prompt, skey)
+            mine = [b for b in free if owners[b] == key]
+            if mine:
+                return min(mine, key=lambda b: (-shared_prefix(b), self.slot_used[b]))
+            # its chain is in a slot that is busy (its own turn running, or a read that gave way): the request
+            # queues for that slot.  Taking another would put a second copy of the conversation in the engine,
+            # and evict whatever the second copy lands on
+            for b in self.slot_order:
+                if (not zones or zones[b] == zone) and self.slot_busy[b] and owners[b] == key:
+                    return None
+            # a slot nobody owns (never used, or its conversation idle past the grace): the newest conversation
+            # takes those first, so it never displaces a live chain
+            unowned = [b for b in free if not self._slot_owned_live(b, now)]
+            if unowned:
+                return min(unowned, key=lambda b: (-shared_prefix(b), self.slot_used[b]))
             return None
         gs = getattr(self, "slot_gs", 0)
         if gs:
@@ -1869,16 +1965,6 @@ class StrataEngine:
                 g0 = b - b % gs
                 return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
             return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
-        def shared_prefix(b):
-            """How many leading tokens this slot and the prompt have in common.  What the engine can reuse is its
-            own decision (it answers with RESUME), so the server only ranks the candidates: a slot holding part of
-            the prompt's start is the best of them, and the rest is read again."""
-            h = self.slot_held[b]
-            n = min(len(h), len(prompt))
-            i = 0
-            while i < n and h[i] == prompt[i]:
-                i += 1
-            return i
         if _BTRACE:
             btrace(f"pick_slot need={len(prompt)} zone={zone} free={free}",
                    [f"slot{b}:shared{shared_prefix(b)}:held{len(self.slot_held[b])}"
@@ -1920,6 +2006,13 @@ class StrataEngine:
                 v["cap"] = caps[b] if caps and b < len(caps) else 0
                 v["locked"] = self._slot_locked(b)
                 v["idle_s"] = round(now - self.slot_used[b], 1)
+                # "slot_ownership_s": who holds the slot and whether the window is still open on it.  The fourth
+                # conversation not running is invisible on the panel without this: the slot reads "idle, free"
+                # while it is closed to every conversation but its owner, which is exactly the state to see.
+                owners = getattr(self, "slot_owner", None)
+                if owners is not None and getattr(self, "session_ownership_s", 0.0):
+                    v["owner"] = owners[b]
+                    v["owned"] = self._slot_owned_live(b, now)
             view.append(v)
         return view
 
@@ -2670,16 +2763,75 @@ def protected_slots_of(batch: int, cfg: dict) -> list[str]:
     a probe) that evict nothing and are not worth a chain.  A top-level setting like "parallel": the partition
     routes the server's own slots, the engine takes any free slot BGEN names, so it never reaches the engine's
     command line (an unknown argument there ends the engine).  Empty list: no partition, every slot serves
-    every request (the default, byte-identical)."""
+    every request (the default, byte-identical).
+
+    A config that asks for a partition and gets none is said out loud.  The engine can report fewer slots than
+    the config was written for (INFO batch_slots=, a layer split, a --fit cap), and then the slots the user
+    named fall off the end: parallel 3 written "protected_slots": [0,1,2] is every slot protected, which is no
+    partition, and the conversation whose chain the config meant to protect is evicted by a one-shot call with
+    nothing in the log to trace."""
     raw = (cfg or {}).get("protected_slots")
     if raw is None:
         return []
     items = raw if isinstance(raw, (list, tuple)) else str(raw).replace(",", " ").split()
-    kept = {int(x) for x in items if str(x).strip().lstrip("-").isdigit()}
-    kept = {b for b in kept if 0 <= b < batch}
-    if not kept or len(kept) == batch:   # all slots protected = no partition: keep the byte-identical default
+    asked = [int(x) for x in items if str(x).strip().lstrip("-").isdigit()]
+    kept = {b for b in asked if 0 <= b < batch}
+    dropped = sorted({b for b in asked if b not in kept})
+    if dropped:
+        print(f'[strata] config "protected_slots": {dropped} are not slots of this engine ({batch} slots): they '
+              "protect nothing", flush=True)
+    if not kept:
+        if asked:
+            print(f'[strata] config "protected_slots"={raw!r}: none of those is a slot of this engine: no '
+                  "partition, every slot serves every request (a conversation's cache is open to the one-shot "
+                  "calls)", flush=True)
+        return []
+    if len(kept) == batch:
+        print(f'[strata] config "protected_slots"={raw!r}: all {batch} slots are protected, which routes nothing: '
+              "no partition (leave one slot out for the one-shot calls)", flush=True)
         return []
     return ["protected" if b in kept else "guest" for b in range(batch)]
+
+
+SESSION_KEY_TOKENS = 512   # the start of a prompt: what every later turn of a conversation carries unchanged
+
+
+def slot_ownership_of(cfg: dict) -> float:
+    """The config's "slot_ownership_s" (like "parallel"): how long a slot belongs to the conversation that last
+    used it, during which no other conversation takes it.  A conversation's chain lives in one slot; without
+    ownership a neighbour's turn lands there and the engine drops what it held, so the conversation reads its
+    whole prompt again every turn.  Absent, 0, false: no ownership, every free slot serves every request (the
+    default, byte-identical).  This is a veto and asks no token floor - the eviction lock is a weight and needs
+    SLOT_PROTECT_MIN_TOKENS, which a 12.7K-token agent conversation never reaches."""
+    raw = (cfg or {}).get("slot_ownership_s")
+    if raw is None or raw is True or raw is False:
+        return 0.0
+    if isinstance(raw, str):
+        if raw.strip().lower() in ("", "0", "false", "no", "off", "none"):
+            return 0.0
+        raw = raw.strip()
+    if not isinstance(raw, (int, float)):
+        try:
+            raw = float(raw)
+        except (TypeError, ValueError):
+            print(f'[strata] config "slot_ownership_s"={raw!r}: expected a number of seconds: ownership off',
+                  flush=True)
+            return 0.0
+    seconds = float(raw)
+    if seconds <= 0:
+        return 0.0
+    return seconds
+
+
+def session_of(sampling: dict | None) -> str | None:
+    """The conversation a request names itself as ("strata_session", beside "strata_checkpoint"): the id a
+    conversation keeps its slot by.  A prompt's start is what the pick matches on, and clients rewrite it -
+    a system prompt edited mid-session, a timestamp injected, history trimmed - which moves the conversation to
+    another slot and costs it the whole prompt.  None: the prompt's own start identifies it."""
+    raw = (sampling or {}).get("strata_session")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
 
 
 def solo_path_of(cfg: dict) -> bool:
@@ -3826,6 +3978,20 @@ class Service:
             live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
+            # "slot_ownership_s": the window the slots render their ownership flags against.  The flag on a row
+            # is "how much of the window is left", which the panel cannot work out from the row alone
+            window = float(getattr(self.engine, "session_ownership_s", 0.0) or 0.0)
+            if window:
+                live["slot_ownership_s"] = window
+                # who is inside a slot, queued for one, and outside the slots.  The window makes the difference
+                # visible: a conversation with a turn running is in a slot, one whose turn ended and whose slot
+                # is closed to the others is not (it holds a slot, it is not using one), and one beyond the
+                # protected slots waits.  Without this the screen shows idle slots and a conversation that has
+                # not produced a token, and there is nothing to tell the two situations apart
+                owners = getattr(self.engine, "slot_owner", None) or []
+                live["slot_holders"] = sum(1 for b in range(len(owners))
+                                           if owners[b] is not None
+                                           and self.engine._slot_owned_live(b, now))
             if running and state == "idle":
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
@@ -6698,7 +6864,8 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         try:
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=child_env(rc), lazy=lazy, cpus=cpus[i] if cpus else None,
-                                      protected_slots=rc.get("protected_slots"), solo_path=rc.get("solo_path"))
+                                      protected_slots=rc.get("protected_slots"), solo_path=rc.get("solo_path"),
+                                      slot_ownership_s=rc.get("slot_ownership_s"))
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
@@ -6902,7 +7069,7 @@ def main() -> int:
         else:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy, protected_slots=cfg.get("protected_slots"),
-                                  solo_path=cfg.get("solo_path"))
+                                  solo_path=cfg.get("solo_path"), slot_ownership_s=cfg.get("slot_ownership_s"))
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],

@@ -181,5 +181,66 @@ class OlderServer(unittest.TestCase):
         self.assertIn("Strata", screen(m))
 
 
+class Ownership(unittest.TestCase):
+    """"slot_ownership_s": a slot belongs to a conversation, and the panel is the only place that shows it.  An
+    owned slot reads "idle, free" while it is closed to every conversation but its owner - which is what makes
+    the fourth conversation not run, and what a user has to be able to see."""
+
+    def payload(self, window=120.0, owners=(("s:task-42", None), ("s:task-7", 240.0), None, None)):
+        """Four slots, a 120 s window: slot 0 runs its conversation, slot 1 holds one idle past the window (its
+        chain is dead and the slot is open), slots 2-3 have none.  owners: (key, idle_s) per slot."""
+        m = metrics()
+        m["live"]["slot_ownership_s"] = window
+        m["live"]["slot_holders"] = sum(1 for owner in owners
+                                        if owner and (owner[1] is None or owner[1] <= window))
+        for s, owner in zip(m["live"]["slots"], owners):
+            s.pop("owner", None)
+            s.pop("owned", None)
+            if owner is None:
+                continue
+            key, idle = owner if isinstance(owner, tuple) else (owner, s.get("idle_s"))
+            s["owner"], s["owned"] = key, (idle is not None and idle <= window)
+        return m
+
+    def rows(self, m):
+        """The slot rows by slot number, from a /metrics payload."""
+        return {ln.split()[1]: ln.rstrip() for ln in screen(m).splitlines() if ln.startswith("  slot ")}
+
+    def test_the_running_slots_owner_shows_and_the_head_names_the_window(self):
+        m = self.payload()
+        self.assertIn("task-42", self.rows(m)["0"])
+        self.assertIn(f"window {ST.dur_text(120.0)}", screen(m))
+
+    def test_an_idle_owned_slot_shows_the_window_left(self):
+        m = self.payload()
+        m["live"]["slots"][1]["owner"], m["live"]["slots"][1]["owned"] = "s:task-7", True
+        m["live"]["slots"][1]["idle_s"] = 30.0          # 90 s of the 120 s window left
+        row = self.rows(m)["1"]
+        self.assertIn("task-7", row)
+        self.assertIn("owns", row)
+        self.assertIn(ST.dur_text(90.0), row)
+
+    def test_a_slot_whose_owner_went_idle_past_the_window_is_marked(self):
+        row = self.rows(self.payload())["1"]
+        self.assertIn("task-7", row)
+        self.assertIn("stale", row)
+
+    def test_an_unowned_slot_says_nothing_about_ownership(self):
+        rows = self.rows(self.payload())
+        self.assertNotIn("owns", rows["3"])
+        self.assertNotIn("stale", rows["3"])
+
+    def test_no_window_is_the_screen_as_it_was(self):
+        # an older server (no owner fields) and an engine with the window off: the flags column is what it was
+        m = self.payload(window=0.0, owners=(None, None, None, None))
+        m["live"].pop("slot_ownership_s")
+        for row in self.rows(m).values():
+            self.assertNotIn("owns", row)
+            self.assertNotIn("stale", row)
+        rows = self.rows(m)
+        self.assertIn("LOCKED", rows["0"])
+        self.assertIn("free", rows["2"])
+
+
 if __name__ == "__main__":
     unittest.main()

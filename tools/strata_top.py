@@ -219,6 +219,25 @@ def idle_text(seconds) -> str:
     return dur_text(seconds)
 
 
+def owner_flag(s: dict, window) -> str:
+    """The flags a slot gets for "slot_ownership_s": who owns it, and how much of the window is left on it.  A
+    slot that is idle and owned reads "idle free" without this, while it is closed to every conversation but
+    its owner - which is why the fourth conversation does not run.  Past the window the slot holds a dead
+    conversation and the next one takes it: "stale", the state to see when a chain is about to be rebuilt.
+    The id is what the client named ("strata_session"); a hashed start is a digest and reads as itself.  No
+    window (an engine without the setting, an older server): no flag, the screen is as it was."""
+    if not window or window <= 0 or "owner" not in s:
+        return ""
+    owner = s.get("owner")
+    if owner is None:
+        return ""
+    short = owner[2:] if owner[:2] in ("s:", "p:") else owner
+    if not s.get("owned"):
+        return f"stale {short}"
+    left = window - (s.get("idle_s") or 0.0)
+    return f"owns {short} {dur_text(max(0.0, left))}"
+
+
 def title_panel(m: dict, pal: Palette) -> list[str]:
     """The headline: the model, the engine's version, the context, the state and how long it has been up."""
     eng, live, totals = m.get("engine", {}), m.get("live", {}), m.get("totals") or {}
@@ -301,6 +320,7 @@ def slots_panel(m: dict, pal: Palette) -> list[str]:
     if not slots:
         return []
     zones = [s.get("zone") for s in slots if s.get("zone")]
+    window = live.get("slot_ownership_s") or 0
     busy = sum(1 for s in slots if s.get("state") not in (None, "idle"))
     head = pal.label("slots") + f"{len(slots)}"
     if busy:
@@ -308,6 +328,13 @@ def slots_panel(m: dict, pal: Palette) -> list[str]:
     if zones:
         protected = sum(1 for z in zones if z == "protected")
         head += f"  ({protected} protected / {len(zones) - protected} guest)"
+    if window:
+        # how many slots a live conversation holds, of the slots that can be held: the window is a semaphore on
+        # the conversations that run at once, not a cap on the conversations that are connected.  "3/3 held" and
+        # six conversations producing tokens is the whole picture of that, on one line
+        holders = live.get("slot_holders")
+        seats = sum(1 for s in slots if s.get("zone") == "protected") if zones else len(slots)
+        head += f"  (owned {holders if holders is not None else '?'} of {seats}, window {dur_text(window)})"
     rows = [pal.bold(head)]
     if zones:
         rows.append(pal.dim(f"{'':<10} {'zone':<10} {'cap':>9}  {'state':<11} {'tokens':>17}  {'tok/s':>8}"
@@ -327,6 +354,9 @@ def slots_panel(m: dict, pal: Palette) -> list[str]:
             flags = ",".join((["LOCKED"] if s.get("locked") else [])
                              + (["cache"] if state == "idle" and s.get("held_tokens")
                                 else ["free"] if state == "idle" else []))
+            owned = owner_flag(s, window)
+            if owned:
+                flags = f"{flags} {owned}" if flags else owned
             flags = pal.paint("yellow", flags) if s.get("locked") else pal.dim(flags)
             rows.append(f"{f'  slot {s.get('slot')}'!s:<10} {s.get('zone')!s:<10} {num(s.get('cap')):>9}  {state_c}"
                         f" {tokens:>17}  {val(s.get('tok_s')):>8}  {pal.paint('dim', f'{clock:>7}')}"

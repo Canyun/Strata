@@ -324,7 +324,7 @@ class PickSlot(unittest.TestCase):
         e.slot_held[0] = list(range(20000))                     # a conversation over the lock's size floor
         e.slot_used[0] = time.time()                            # ... and used now: locked
         e.slot_held[2] = list(range(20000))
-        e.slot_used[2] = time.time() - 4000                     # idle past the 1800 s grace: evictable
+        e.slot_used[2] = time.time() - 4000                     # idle past the 120 s grace: evictable
         v = e.slots_view()
         self.assertEqual((v[0]["zone"], v[0]["cap"], v[0]["locked"]), ("protected", 200000, True), v[0])
         self.assertLess(v[0]["idle_s"], 5, v[0])

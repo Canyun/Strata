@@ -1,4 +1,4 @@
-"""serve/test_slot_ownership.py - "slot_ownership_s" end to end: a batch slot belongs to the conversation that
+"""serve/test_slot_protect.py - "slot_protect_seconds" end to end: a batch slot belongs to the conversation that
 last used it, and its next turn finds the chain in that slot instead of a neighbour's prompt.
 
 The real StrataEngine and Service run over HTTP behind the fake engine of test_parallel.py, extended with
@@ -7,7 +7,7 @@ enough to watch the next conversations arrive.  The window that owns a slot has 
 window shorter than a turn lets the next conversation in while the first is still decoding, which is legal
 behaviour and exercises nothing.  No GPU is needed:
 
-    python -m pytest serve/test_slot_ownership.py -v
+    python -m pytest serve/test_slot_protect.py -v
 """
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ class OwnershipEndToEnd(unittest.TestCase):
         extra = ["--batch", str(slots or self.BATCH), "--log", str(self.log)]
         self.engine = StrataEngine("strata", extra, solo_path=False,
                                    protected_slots=self.PROTECTED if protected is None else protected,
-                                   slot_ownership_s=ownership_s)
+                                   slot_protect_seconds=ownership_s)
         tok = ByteTokenizer()
         self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
@@ -189,7 +189,7 @@ class OwnershipEndToEnd(unittest.TestCase):
         late, extra = self.threads([("c3", session_prompt(3), None), ("c4", session_prompt(4), None)], gap=GAP)
         self.assertEqual(self.count_at(4, timeout=1.0), 3,
                          f"a fourth conversation took a slot a live conversation owns: {self.admitted()}")
-        self.engine.session_ownership_s = SHORT       # the window passes: the queued conversations go in
+        self.engine.slot_protect_seconds = SHORT       # the window passes: the queued conversations go in
         for t in runs + extra:
             t.join(90)
         admitted = self.admitted()
@@ -209,7 +209,7 @@ class OwnershipEndToEnd(unittest.TestCase):
         fourth = threading.Thread(target=self.one, args=(late, "c9", session_prompt(9), None))
         fourth.start()
         self.assertEqual(self.count_at(4, timeout=1.5), 3, "a conversation took a slot inside the window")
-        self.engine.session_ownership_s = SHORT       # the window passes: it goes in
+        self.engine.slot_protect_seconds = SHORT       # the window passes: it goes in
         fourth.join(60)
         self.assertEqual(len(self.admitted()), 4, self.admitted())
         for t in runs:
@@ -390,7 +390,7 @@ class OwnershipEndToEnd(unittest.TestCase):
     def test_the_window_comes_from_the_config_and_absent_is_off(self):
         # absent: the mechanism does not run at all (the default path stays exactly as it was)
         self.start(None)
-        self.assertEqual(self.engine.session_ownership_s, 0.0)
+        self.assertEqual(self.engine.slot_protect_seconds, 0.0)
         self.assertEqual(self.engine.slot_owner, [None] * self.BATCH)
 
     def test_a_restart_keeps_the_window_and_the_partition(self):
@@ -400,7 +400,7 @@ class OwnershipEndToEnd(unittest.TestCase):
         self.assertEqual(self.engine.spawn[8], self.PROTECTED)
         self.assertEqual(self.engine.spawn[10], WINDOW)
         self.engine.restart()
-        self.assertEqual(self.engine.session_ownership_s, WINDOW)
+        self.assertEqual(self.engine.slot_protect_seconds, WINDOW)
         self.assertEqual(self.engine.slot_owner, [None] * self.BATCH)
         self.assertEqual(self.engine.slot_zone.count("protected"), len(self.PROTECTED), self.engine.slot_zone)
         self.chat(session_prompt(0))        # the restarted engine answers, and answers in a protected slot

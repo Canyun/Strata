@@ -10049,8 +10049,12 @@ int main(int argc, char** argv) {
                 }
             }
             if (dynamic_rows && batch_mtp && plan_slots > 0) {
+                // the plan cannot ask a slot for more rows than the physics holds: the residual buffer and the
+                // drafter's window are o.spec rows (slot_mtp_rows above, d->load(..., o.spec)), so a slot's
+                // rows cap there - deeper drafts need --spec, not more slots
+                const int cap = std::min(strata::kernels::kVerifyMaxT, o.spec);
                 strata::program::batch_draft_rows::split(plan, plan_slots, plan_active, plan_offered,
-                                                         plan_accepted, strata::kernels::kVerifyMaxT);
+                                                         plan_accepted, cap);
                 // repack the window along the plan: every slot's token row first, then its proposal rows at
                 // consecutive positions (batch_rows_error's layout: a slot's rows are contiguous, positions +1)
                 S = 0;

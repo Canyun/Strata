@@ -109,6 +109,15 @@ int main() {
         CHECK(p.count == 3);
         CHECK(p.rows[0] + p.rows[1] + p.rows[2] == 3);
     }
+    // A small capacity still distributes every row it has: the plan never leaves rows on the table when a
+    // strong slot could use them (a capacity of 4 -- --spec 4 -- is not a reason to run 1/1/2 when 2/1/1
+    // serves the same count; the exact split follows the shares)
+    {
+        const Plan p = plan_of({{true, 100, 95}, {true, 100, 0}, {true, 100, 0}}, 4);
+        CHECK(p.total_rows == 4);
+        CHECK(p.rows[0] == 2);                           // the 95% slot buys the one surplus row
+        CHECK(p.rows[1] == 1 && p.rows[2] == 1);         // the refused-everything slots keep their token rows
+    }
     if (fails == 0) std::printf("batch_draft_rows_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

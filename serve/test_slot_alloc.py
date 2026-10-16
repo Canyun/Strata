@@ -18,6 +18,7 @@ from serve.server import (  # noqa: E402
     session_of,
     slot_caps_of,
     slot_protect_seconds_of,
+    SLOT_PROTECT_MAX_S,
     zone_of,
 )
 
@@ -433,6 +434,14 @@ class OwnershipConfig(unittest.TestCase):
     def test_the_former_name_off_stays_off(self):
         self.assertEqual(slot_protect_seconds_of({"slot_ownership_s": 0}), 0.0)
         self.assertEqual(slot_protect_seconds_of({"slot_ownership_s": "off"}), 0.0)
+
+    def test_a_window_past_the_ceiling_is_clamped_not_taken(self):
+        # a huge window (a typo, a paste) owns every slot forever: no conversation ever goes idle past it, so
+        # the batch starves the conversations beyond the protected slots (the review's finding #4).  The ceiling
+        # clamps with a warning, never a silent permanent lock.
+        self.assertEqual(slot_protect_seconds_of({"slot_protect_seconds": SLOT_PROTECT_MAX_S}), SLOT_PROTECT_MAX_S)
+        self.assertEqual(slot_protect_seconds_of({"slot_protect_seconds": SLOT_PROTECT_MAX_S + 1}), SLOT_PROTECT_MAX_S)
+        self.assertEqual(slot_protect_seconds_of({"slot_protect_seconds": 1_000_000_000}), SLOT_PROTECT_MAX_S)
 
     def test_the_conversation_may_name_itself(self):
         # an agent that rewrites its system prompt mid-session changes its prompt's start and would lose the slot

@@ -351,13 +351,17 @@ def slots_panel(m: dict, pal: Palette) -> list[str]:
         state_c = pal.paint({"decoding": "green", "reading": "cyan"}.get(state, "dim"), f"{state!s:<11}")
         drafts_c = pal.rpad(tone(accept_rate(s), GOOD, WARN), draft_text(s), 14)
         if zones:
-            flags = ",".join((["LOCKED"] if s.get("locked") else [])
+            # with the ownership window on, the eviction lock's LOCKED ranks nothing the pick obeys (a
+            # conversation's pick returns at the veto): it next to "owns"/"stale" is a second, dead flag for
+            # the same slot.  The window's own flags say what the pick obeys; LOCKED stays for the screen
+            # without a window, where the lock's ordering is what routes.
+            flags = ",".join((["LOCKED"] if s.get("locked") and not window else [])
                              + (["cache"] if state == "idle" and s.get("held_tokens")
                                 else ["free"] if state == "idle" else []))
             owned = owner_flag(s, window)
             if owned:
                 flags = f"{flags} {owned}" if flags else owned
-            flags = pal.paint("yellow", flags) if s.get("locked") else pal.dim(flags)
+            flags = pal.paint("yellow", flags) if s.get("locked") and not window else pal.dim(flags)
             rows.append(f"{f'  slot {s.get('slot')}'!s:<10} {s.get('zone')!s:<10} {num(s.get('cap')):>9}  {state_c}"
                         f" {tokens:>17}  {val(s.get('tok_s')):>8}  {pal.paint('dim', f'{clock:>7}')}"
                         f"  {drafts_c}  {flags}")

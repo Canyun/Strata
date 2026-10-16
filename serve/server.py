@@ -2796,6 +2796,10 @@ def protected_slots_of(batch: int, cfg: dict) -> list[str]:
 SESSION_KEY_TOKENS = 512   # the start of a prompt: what every later turn of a conversation carries unchanged
 
 
+SLOT_PROTECT_MAX_S = 86400.0       # a day: a window past it owns every slot forever - no conversation goes idle
+                                   # past it, so the conversations beyond the protected slots queue for good
+
+
 def slot_protect_seconds_of(cfg: dict) -> float:
     """The config's "slot_protect_seconds" (like "parallel"): how long a slot belongs to the conversation that last
     used it, during which no other conversation takes it.  A conversation's chain lives in one slot; without
@@ -2805,7 +2809,9 @@ def slot_protect_seconds_of(cfg: dict) -> float:
     SLOT_PROTECT_MIN_TOKENS, which a 12.7K-token agent conversation never reaches.  The name sits beside
     SLOT_PROTECT_IDLE_GRACE_S, which is that eviction lock's window (a weight, with the 16384-token floor): the
     two windows are not one mechanism, and this is the veto.  An older config's "slot_ownership_s" is this
-    field's former name and is read as such (a setup before the rename wrote it); the new name wins if both."""
+    field's former name and is read as such (a setup before the rename wrote it); the new name wins if both.
+    A window above SLOT_PROTECT_MAX_S is clamped with a warning: a past-it value locks the batch slots to the
+    first conversations, and a request from any other conversation queues for a window that never passes."""
     cfg = cfg or {}
     raw = cfg.get("slot_protect_seconds")
     if raw is None and "slot_ownership_s" in cfg:
@@ -2828,6 +2834,13 @@ def slot_protect_seconds_of(cfg: dict) -> float:
     seconds = float(raw)
     if seconds <= 0:
         return 0.0
+    if seconds > SLOT_PROTECT_MAX_S:
+        # a window past the ceiling never passes: the slots stay owned and every other conversation queues for
+        # good.  Clamp with a warning - a paste, a typo (1000000000), a hand-edit - rather than lock the batch.
+        print(f'[strata] config "slot_protect_seconds"={seconds:.0f} clamped to {SLOT_PROTECT_MAX_S:.0f}: a longer '
+              "window keeps the protected slots owned forever and the conversations beyond them queue for good",
+              flush=True)
+        return SLOT_PROTECT_MAX_S
     return seconds
 
 

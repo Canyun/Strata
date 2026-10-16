@@ -4414,6 +4414,10 @@ def write_config(path: Path, cfg: dict):
 # "sampling" or "mcp_servers" block, "allowed_hosts", "cors_origins", "open_browser" - and is kept when setup runs again
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
+# the fork's slot-protection keys: written together as one mechanism, and only when --slot-protect-seconds is given,
+# so they are deliberately NOT in SETUP_KEYS (a user's hand-written values must survive a plain setup re-run).  The
+# off path drops them from the installed config through carry_over's `drop` (slot_protection_apply).
+SLOT_PROTECTION_KEYS = frozenset({"slot_protect_seconds", "protected_slots", "solo_path"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
                        "STRATA_ROUTE_TAIL_SKIP"})   # the "env" entries setup writes
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
@@ -4423,15 +4427,17 @@ SETUP_ENV_UNSLOTH = frozenset({"STRATA_MMQ_KQ", "STRATA_HC_Q8", "STRATA_ROUTE_TA
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 
-def carry_over(old: dict, cfg: dict) -> list[str]:
+def carry_over(old: dict, cfg: dict, drop=frozenset()) -> list[str]:
     """#629: setup run again for an installed model keeps what the user added to its run config: every key setup does
     not write (`SETUP_KEYS`), the "env" entries setup does not write, and in "vision" the keys setup does not write
     plus an mmproj of their own (a Q8_0 one, #625) that still exists.  `cfg` (the new config) is updated in place;
     the names of what was kept are returned.  Engine options added by hand to "args" are not merged (setup chooses
-    those): `args_dropped` names them."""
+    those): `args_dropped` names them.  `drop`: keys this run means to remove - setup writes the slot-protection
+    keys only when asked, so they are not SETUP_KEYS and a plain pop() of them is undone here (the switch never
+    turned off); the write passes what slot_protection_apply said off."""
     kept = []
     for k, v in old.items():
-        if k not in SETUP_KEYS and k not in cfg:
+        if k not in SETUP_KEYS and k not in cfg and k not in drop:
             cfg[k] = v
             kept.append(k)
     mine = SETUP_ENV if "-unsloth-" in str(cfg.get("model_name") or "") else SETUP_ENV - SETUP_ENV_UNSLOTH
@@ -4492,11 +4498,12 @@ def args_dropped(old: dict, cfg: dict) -> list[str]:
     return list(dict.fromkeys(f for f in flags(old) if f not in new))
 
 
-def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) -> None:
+def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, drop=frozenset()) -> None:
     """#629: setup's run config, written over an earlier one for the same model without losing what the user added
     to it: the keys setup does not write are carried over (carry_over), and the earlier file is kept as
     strata-<model>.json.bak when it changes.  `source`: an earlier install's config to carry the keys over from when
-    this folder has none yet (a copy set up like the last one).  A line says what was kept, one what was not."""
+    this folder has none yet (a copy set up like the last one).  A line says what was kept, one what was not.
+    `drop`: the keys this run turns off, removed from the installed config (carry_over honours it)."""
     old_path = cfg_path if cfg_path.is_file() else source
     old = None
     if old_path is not None and old_path.is_file():
@@ -4506,7 +4513,9 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) ->
             pass
         if not isinstance(old, dict):
             old = None
-    kept = carry_over(old, cfg) if old is not None else []
+    kept = carry_over(old, cfg, drop=drop) if old is not None else []
+    for k in drop:
+        cfg.pop(k, None)
     if "images" in cfg and cfg["images"] is None:      # --images no (or not downloaded): no image section
         cfg.pop("images")
     bak = None
@@ -5204,6 +5213,57 @@ def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: st
     return lines
 
 
+def slots_for_protection(asked_parallel, cfg: dict, old: dict):
+    """The slot count the window is sized on: this run's --parallel, else what this run's config carries, else the
+    installed config's.  A re-run that names only --slot-protect-seconds has no --parallel on the command line and
+    the fresh cfg has none yet (parallel merges at write time), so the installed config is what answers - reading
+    the fresh cfg alone saw 0 and refused the mechanism with "needs parallel of 2+" on a 4-slot install."""
+    for source in (asked_parallel, cfg.get("parallel"), (old or {}).get("parallel")):
+        if isinstance(source, int) and not isinstance(source, bool) and source >= 1:
+            return source
+    return 0
+
+
+def _installed_cfg(tag) -> dict:
+    """The installed run config for this model, read early: the slot-protection block needs the parallel of a
+    re-run that does not name --parallel, and that value reaches the fresh cfg only at write time (carry_over)."""
+    path = ROOT / f"strata-{str(tag).lower()}.json"
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8-sig")) if path.is_file() else {}
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def slot_protection_apply(a, cfg: dict, old: dict, ok, warn) -> frozenset:
+    """Write (or turn off) the fork's slot protection: the window, its partition, and the solo path off - three
+    keys that are one mechanism (serve/server.py: the solo path takes no slot and owns nothing, a full partition
+    is no partition).  Returns the keys to drop from the installed config: setup writes these keys only when asked,
+    so they are not SETUP_KEYS and carry_over would move the old ones back over a plain pop() - the switch never
+    turned off (the review's finding #1).  `old`: the installed config, read for the parallel fallback.
+
+    Only a run that asks for the mechanism off removes it.  A run that asks for a window the slot count cannot
+    size is refused with a warning, and the installed mechanism stays exactly as it was: this run asked for the
+    mechanism, it never asked for its loss."""
+    if getattr(a, "slot_protect_seconds", None) is None:
+        return frozenset()          # this run does not touch the mechanism: carry the user's own keys over
+    asked = 0 if isinstance(a.slot_protect_seconds, bool) else slot_protect_seconds_arg(a.slot_protect_seconds)
+    slots = slots_for_protection(getattr(a, "parallel", None), cfg, old)
+    seconds, notes = slot_protect_seconds_choice(asked, slots)
+    for i, line in enumerate(notes):
+        (ok if i == 0 else warn)(line)
+    if seconds > 0:
+        cfg["slot_protect_seconds"] = seconds
+        cfg["protected_slots"] = protected_slots_default(slots)
+        cfg["solo_path"] = False    # the solo path takes no slot: nothing there is owned (serve/server.py)
+        return frozenset()
+    if asked > 0:
+        return frozenset()          # the window was refused (no slots to size it on): nothing here is removed
+    for key in SLOT_PROTECTION_KEYS:
+        cfg.pop(key, None)
+    return SLOT_PROTECTION_KEYS      # off: the installed config's copies go too (carry_over honours this)
+
+
 def protected_slots_default(parallel) -> list[int]:
     """The partition that goes with slot ownership: every slot but one keeps a conversation's chain, the last
     serves the one-shot calls (a classification, a probe) that evict nothing.  All slots protected would be no
@@ -5211,6 +5271,18 @@ def protected_slots_default(parallel) -> list[int]:
     if not isinstance(parallel, int) or isinstance(parallel, bool) or parallel < 2:
         return []
     return list(range(parallel - 1))
+
+
+def slot_protect_seconds_arg(text):
+    """The value of --slot-protect-seconds, as a parser's type: the seconds, or 0 for the words that mean off.
+    "0" alone is awkward at a terminal - an agent that turns a mechanism off reaches for the word, and the help
+    has always advertised "0/off" - so the words are accepted.  A non-number ("10s", "120.5") raises, and argparse
+    turns that into its own usage error."""
+    if isinstance(text, str):
+        word = text.strip().lower()
+        if word in ("off", "none", "no", "false", "disable", "disabled"):
+            return 0
+    return int(text)
 
 
 def slot_protect_seconds_choice(asked, parallel) -> tuple[float, list[str]]:
@@ -5678,6 +5750,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if a.browser is not None:
         cfg["open_browser"] = a.browser
     cfg["args"] = recommend_pool_workers(cfg["args"])   # --pool-workers: this engine path's CPU expert threads too
+    # the slot protection needs batch slots (this path writes no --parallel): apply() warns and writes nothing.
+    # It returns the keys to drop, which is always empty here (no --slot-protect-seconds on this Namespace), so
+    # the write below keeps its plain signature - own_path never carries the mechanism off.
+    slot_protection_apply(a, cfg, _installed_cfg(tag), ok, warn)
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
@@ -5844,10 +5920,10 @@ def main() -> int:
     ap.add_argument("--parallel", type=int, metavar="N",
                     help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
                          "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
-    ap.add_argument("--slot-protect-seconds", type=int, metavar="N",
+    ap.add_argument("--slot-protect-seconds", type=slot_protect_seconds_arg, metavar="N",
                     help="a batch slot belongs to the conversation that last used it for N seconds: its next turn "
                          "returns to the chain in that slot and no other conversation takes the slot meanwhile "
-                         "(opt-in; 0/off turns it off). Needs \"protected_slots\" and \"solo_path\": false, "
+                         "(opt-in; 0, off, none turns it off). Needs \"protected_slots\" and \"solo_path\": false, "
                          "which setup writes together with it")
     ap.add_argument("--replicas", type=int, metavar="N",
                     help="several GPUs: run N independent engines, each on its own equal group of the chosen cards (2 "
@@ -6827,17 +6903,7 @@ def main() -> int:
             ok("parallel requests: one at a time (--parallel 1)")
     # the fork's conversation-slot protection: written together, as one mechanism.  A slot a conversation owns
     # only matters for requests that reach a batch slot, so it needs the partition and the solo path off
-    if a.slot_protect_seconds is not None:
-        slots_asked = a.parallel if a.parallel is not None else cfg.get("parallel")
-        seconds, notes = slot_protect_seconds_choice(a.slot_protect_seconds, slots_asked)
-        for i, line in enumerate(notes):
-            (ok if i == 0 else warn)(line)
-        if seconds > 0:
-            cfg["slot_protect_seconds"] = seconds
-            cfg["protected_slots"] = protected_slots_default(slots_asked)
-            cfg["solo_path"] = False    # the solo path takes no slot: nothing there is owned (serve/server.py)
-        else:
-            cfg.pop("slot_protect_seconds", None)
+    protection_off = slot_protection_apply(a, cfg, _installed_cfg(tag), ok, warn)
     if vision != "none":
         old_cfg = ROOT / f"strata-{tag.lower()}.json"
         vt = vision_tokens(a.vision_tokens, vision, old_cfg if old_cfg.is_file() else adopted)
@@ -6863,7 +6929,8 @@ def main() -> int:
             say("  " + line)
     for line in bench_tips(cfg["args"], cfg.get("env"), ram, MODELS[model]["ram_gb"], gpu.get("vram_gb", 0.0), vision, WIN):
         say("  " + line)
-    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
+    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None,
+                       drop=protection_off)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
     if cal is None and not hip and not a.no_start and not a.yes and ask(

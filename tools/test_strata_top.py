@@ -228,6 +228,16 @@ class Ownership(unittest.TestCase):
         self.assertIn("task-7", row)
         self.assertIn("stale", row)
 
+    def test_the_screen_with_a_window_shows_owns_not_the_eviction_lock(self):
+        # with the window on, the eviction lock's LOCKED flag ranks nothing the pick obeys (a conversation's
+        # pick returns at the ownership veto): showing it next to "stale"/"owns" is a second, dead flag for
+        # the same slot - the contradiction the user's panel showed as "LOCKED stale task-42"
+        m = self.payload()
+        m["live"]["slots"][0]["owned"] = True       # decoding: used this instant, the window is open on it
+        rows = self.rows(m)
+        self.assertIn("owns", rows["0"])
+        self.assertNotIn("LOCKED", screen(m))
+
     def test_an_unowned_slot_says_nothing_about_ownership(self):
         rows = self.rows(self.payload())
         self.assertNotIn("owns", rows["3"])

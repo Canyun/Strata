@@ -1,12 +1,12 @@
-// A CPU-only stand-in for CUDA's <cuda_runtime.h>: the two cudaError_t values the checkpoint paths branch on
-// and the types a header-only helper needs.  The build of memory_guard_test has no CUDA toolkit (CMakeLists:
-// "CPU only, no GPU"), and a native <cuda_runtime.h> would not compile on this machine anyway.
+// A CPU-only stand-in for CUDA's <cuda_runtime.h>: the cudaError_t values the checkpoint paths branch on and the
+// types a header-only helper needs.  The build of memory_guard_test has no CUDA toolkit (CMakeLists: "CPU only,
+// no GPU"), and a native <cuda_runtime.h> would not compile on this machine anyway.  CUDA 13 removed the
+// cudaErrorOutOfMemory alias, so the real name is the only one here.
 #pragma once
 
 enum cudaError {
     cudaSuccess = 0,
     cudaErrorMemoryAllocation = 2,
-    cudaErrorOutOfMemory = 2,        // the historical alias, CUDA's own value
     cudaErrorIllegalAddress = 700,
     cudaErrorIllegalInstruction = 701,
     cudaErrorDeviceUninitialized = 704,   // cudaErrorUnknown's value in CUDA 13 and later

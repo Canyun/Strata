@@ -75,9 +75,10 @@ inline bool conversation_memory_admit(std::optional<uint64_t> available,
 
 /// Whether a failed CUDA call is the out-of-memory kind the checkpoint paths skip: the next turn re-reads the
 /// tokens the copy would have covered, so losing it costs a re-read, not the session.  A sticky context fault
-/// (illegal address, an unknown error) must keep ending the engine (#224) - never skipped.
+/// (illegal address, an unknown error) must keep ending the engine (#224) - never skipped.  (cudaErrorOutOfMemory
+/// was cudaErrorMemoryAllocation's deprecated alias; CUDA 13 removed it, so only the real name is matched.)
 inline bool cuda_oom_recoverable(cudaError_t status) {
-    return status == cudaErrorMemoryAllocation || status == cudaErrorOutOfMemory;
+    return status == cudaErrorMemoryAllocation;
 }
 
 } // namespace strata::core

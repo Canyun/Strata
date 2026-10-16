@@ -115,7 +115,7 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   target_include_directories(conversation_split_failure_test PRIVATE include)
   add_test(NAME conversation_split_failure_test COMMAND conversation_split_failure_test)
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
-  target_include_directories(conversation_memory_test PRIVATE include)
+  target_include_directories(conversation_memory_test PRIVATE include tests/core)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_file_test PRIVATE include)
@@ -506,10 +506,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
 
   # available_host_bytes(): MemAvailable, cgroup limits and the operator's --memory-limit-mib cap on fixture directories
-  # - no GPU, no CUDA
+  # - no GPU, no CUDA.  The OOM-skip helper lives here too (tests/core/cuda_runtime.h stands in for <cuda_runtime.h>).
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/memory_guard_test.cpp")
     add_executable(memory_guard_test tests/core/memory_guard_test.cpp src/core/conversation_memory.cpp)
-    target_include_directories(memory_guard_test PRIVATE include)
+    target_include_directories(memory_guard_test PRIVATE include tests/core)
     add_test(NAME memory_guard_test COMMAND memory_guard_test)
     set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
   endif()

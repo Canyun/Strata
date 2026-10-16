@@ -1517,9 +1517,24 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const stra
 }
 
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
-bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+///
+/// An out-of-memory copy is skipped, not fatal: the checkpoint only saves a later turn the re-read of a prompt
+/// stretch, and the parking path's rule ("a recoverable miss must not poison the batched draft prefill's error
+/// channel") applies here too.  The sticky error is read AND taken (cudaGetLastError) so the context survives;
+/// every other sticky error stays, for the #224 exit (an illegal address poisons the context - unwinding on it
+/// could hang until the watchdog).
+bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss,
+                     const strata::core::ModelGeometry& g, std::string* oom_note = nullptr) {
     std::string error;
     if (strata::core::conversation_checkpoint_save(c, ss, g, error)) return true;
+    if (strata::core::cuda_oom_recoverable(cudaPeekAtLastError())) {
+        const cudaError_t taken = cudaGetLastError();   // take it: the context must stay clean for the next window
+        std::fprintf(stderr, "strata serve: checkpoint save skipped (out of memory: %s, taken %s); the next turn "
+                             "re-reads the tokens it would have covered\n",
+                     error.c_str(), cudaGetErrorString(taken));
+        if (oom_note) *oom_note = "out of memory";
+        return false;
+    }
     std::fprintf(stderr, "strata serve: checkpoint save: %s\n", error.c_str());   // the caller's ERR has no reason
     return false;
 }
@@ -8456,12 +8471,22 @@ int main(int argc, char** argv) {
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else {
-                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
+                if (!gpu_sync_ok()) return false;
+                std::string oom;
+                if (!checkpoint_save(c, ss, g, &oom)) {
+                    if (oom.empty()) return false;   // not the out-of-memory kind: fatal as before
+                    return true;   // skipped: the read continues, the next turn re-reads this stretch
+                }
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
                     part.ids = c.ids;
-                    if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g)) return false;
+                    if (!gpu_sync_ok()) return false;
+                    std::string part_oom;
+                    if (!checkpoint_save(part, st->ss, g, &part_oom)) {
+                        if (part_oom.empty()) return false;
+                        return true;   // a split without all its parts is no checkpoint (the assembly checks)
+                    }
                     c.stage_parts.push_back(std::move(part));
                 }
             }
@@ -8581,7 +8606,16 @@ int main(int argc, char** argv) {
                     part_next[i] = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
-                    if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
+                    std::string oom;
+                    if (!checkpoint_save(part, stage_ss, g, &oom)) {
+                        if (oom.empty()) { e = "saving a checkpoint part failed"; return false; }
+                        // Out of memory: skip this stage's part.  The assembly at the chunk boundary sees an
+                        // incomplete set (each part's gdn checked non-empty) and saves no checkpoint here - the
+                        // read continues, the position is simply not cached.
+                        std::fprintf(stderr, "strata serve: stage %zu's checkpoint part skipped (out of memory); "
+                                             "this position is not cached\n", i);
+                        return true;
+                    }
                     std::lock_guard<std::mutex> lk(part_mu);
                     auto& v = part_at[done];
                     v.resize(stages.size() + 1);
@@ -9879,7 +9913,10 @@ int main(int argc, char** argv) {
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
+                // through the wrapper: an out-of-memory copy is taken off the sticky slot there, so the failure
+                // stays what the caller already makes of it - this admission becomes BADM <slot> 0 and the next
+                // request reads the prompt - and the #224 exit never sees a stale OOM as a poisoned context
+                if (!checkpoint_save(ck, from, g) ||
                     !strata::core::conversation_checkpoint_restore(ck, to, g, e))
                     return false;
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
@@ -9925,7 +9962,8 @@ int main(int argc, char** argv) {
                 } else {
                     strata::core::ConversationCheckpoint ck;
                     ck.ids = bs[(size_t) b].ids;
-                    if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
+                    // the wrapper: an OOM save comes off the sticky slot, the caller's fallback below reads on
+                    if (!checkpoint_save(ck, from, g) ||
                         !strata::core::conversation_checkpoint_restore(ck, to, g, e))
                         return false;
                 }

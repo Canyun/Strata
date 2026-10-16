@@ -1418,10 +1418,17 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const stra
 }
 
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
-bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+///
+/// A failed copy is skipped, not fatal: SYCL reports errors as exceptions with no sticky-poison semantics
+/// (the #224 exit below compiles to `if (0 != 0)`), so ending the request costs the read it was in, and the
+/// checkpoint only saves a later turn the re-read of the prompt stretch.  The caller's ERR line keeps the reason.
+bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss,
+                     const strata::core::ModelGeometry& g, std::string* oom_note = nullptr) {
     std::string error;
     if (strata::core::conversation_checkpoint_save(c, ss, g, error)) return true;
-    std::fprintf(stderr, "strata serve: checkpoint save: %s\n", error.c_str());   // the caller's ERR has no reason
+    std::fprintf(stderr, "strata serve: checkpoint save skipped (%s); the next turn re-reads the tokens it would "
+                         "have covered\n", error.c_str());
+    if (oom_note) *oom_note = "skipped";
     return false;
 }
 
@@ -7778,12 +7785,22 @@ int main(int argc, char **argv) try {
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else {
-                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
+                if (!gpu_sync_ok()) return false;
+                std::string oom;
+                if (!checkpoint_save(c, ss, g, &oom)) {
+                    if (oom.empty()) return false;   // unreachable today (every failure skips); fatal if that changes
+                    return true;   // skipped: the read continues, the next turn re-reads this stretch
+                }
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
                     part.ids = c.ids;
-                    if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g)) return false;
+                    if (!gpu_sync_ok()) return false;
+                    std::string part_oom;
+                    if (!checkpoint_save(part, st->ss, g, &part_oom)) {
+                        if (part_oom.empty()) return false;
+                        return true;   // a split without all its parts is no checkpoint (the assembly checks)
+                    }
                     c.stage_parts.push_back(std::move(part));
                 }
             }
@@ -7872,7 +7889,16 @@ int main(int argc, char **argv) try {
                     part_next[i] = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
-                    if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
+                    std::string oom;
+                    if (!checkpoint_save(part, stage_ss, g, &oom)) {
+                        if (oom.empty()) { e = "saving a checkpoint part failed"; return false; }
+                        // Skipped: the assembly at the chunk boundary sees an incomplete set (each part's gdn
+                        // checked non-empty) and saves no checkpoint here - the read continues, the position
+                        // is simply not cached.
+                        std::fprintf(stderr, "strata serve: stage %zu's checkpoint part skipped (out of memory); "
+                                             "this position is not cached\n", i);
+                        return true;
+                    }
                     std::lock_guard<std::mutex> lk(part_mu);
                     auto& v = part_at[done];
                     v.resize(stages.size() + 1);
@@ -8895,7 +8921,9 @@ int main(int argc, char **argv) try {
                 }
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
+                // the wrapper prints the skip line and reports through its return: this admission becomes
+                // BADM <slot> 0 and the next request reads the prompt
+                if (!checkpoint_save(ck, from, g) ||
                     !strata::core::conversation_checkpoint_restore(ck, to, g, e))
                     return false;
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
@@ -8963,7 +8991,8 @@ int main(int argc, char **argv) try {
                 } else {
                     strata::core::ConversationCheckpoint ck;
                     ck.ids = bs[(size_t) b].ids;
-                    if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
+                    // the wrapper: the caller's fallback below reads the prompt on
+                    if (!checkpoint_save(ck, from, g) ||
                         !strata::core::conversation_checkpoint_restore(ck, to, g, e))
                         return false;
                 }

@@ -52,6 +52,17 @@ int main() {
     // Test the real provider without assuming any particular amount of free RAM.
     const auto available = available_host_bytes();
     check(!available || conversation_memory_admit(available, 0, 0), "provider returns bytes or unknown");
+
+    // An out-of-memory copy in the checkpoint paths is skipped, not fatal: OOM is recoverable (the next turn
+    // re-reads the tokens the checkpoint would have covered), unlike a poisoned context (illegal address),
+    // which must keep ending the engine.  The call sites read this once, not per copy.
+    check(cuda_oom_recoverable(cudaErrorMemoryAllocation), "CUDA's OOM code is the recoverable kind");
+    check(cuda_oom_recoverable(cudaErrorOutOfMemory), "the historical alias is the recoverable kind too");
+    check(!cuda_oom_recoverable(cudaSuccess), "success is not an OOM");
+    check(!cuda_oom_recoverable(cudaErrorIllegalAddress), "a poisoned context is never skipped");
+    check(!cuda_oom_recoverable(cudaErrorIllegalInstruction), "a poisoned context is never skipped");
+    check(!cuda_oom_recoverable(cudaErrorDeviceUninitialized), "an unknown error is never skipped");
+    check(!cuda_oom_recoverable(cudaErrorUnknown), "an unknown error is never skipped");
 #if defined(_WIN32)
     // Unknown must fail closed in production, but must not let a broken Windows provider pass this test.
     // Compare with total physical memory, not a second available reading: other processes can allocate

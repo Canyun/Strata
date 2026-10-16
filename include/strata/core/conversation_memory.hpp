@@ -5,6 +5,8 @@
 #include <optional>
 #include <string>
 
+#include <cuda_runtime.h>
+
 namespace strata::core {
 
 // The RAM a runtime allocation (parking a conversation, saving or restoring a session file) may still take.
@@ -69,6 +71,13 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 inline bool conversation_memory_admit(std::optional<uint64_t> available,
                                       uint64_t allocation, uint64_t floor) {
     return available && *available >= floor && allocation <= *available - floor;
+}
+
+/// Whether a failed CUDA call is the out-of-memory kind the checkpoint paths skip: the next turn re-reads the
+/// tokens the copy would have covered, so losing it costs a re-read, not the session.  A sticky context fault
+/// (illegal address, an unknown error) must keep ending the engine (#224) - never skipped.
+inline bool cuda_oom_recoverable(cudaError_t status) {
+    return status == cudaErrorMemoryAllocation || status == cudaErrorOutOfMemory;
 }
 
 } // namespace strata::core

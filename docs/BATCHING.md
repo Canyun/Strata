@@ -27,6 +27,15 @@ engine's free-memory log before using it on a smaller card. If it cannot run (on
 GPU) the engine says so and batches as usual. RTX PRO 5000 owners measured +31% to +39% total throughput with 2 to 4
 clients on one GPU (a RX R9700 run too).
 
+`STRATA_BATCH_MTP_DYNAMIC=1` (experimental, opt-in, this fork) hands the window's eight rows out by the slots'
+acceptance records instead of the fixed two rows per slot: every active slot always keeps its token row (a slot's
+row is its conversation's progress, never taken away), a slot the target has been taking proposals from buys more
+of the spare rows (deeper drafts per window), a slot whose proposals were all refused (100+ offers, none taken)
+keeps only its token row, and a slot with too few offers to read keeps the one proposal row the fixed window gave
+it. The engine logs nothing extra; the slot tallies in `BDONE` (drafts accepted of offered) and the server's
+`drafts` panel show the split working. Measure before keeping it on: the rows a strong slot gains are rows the
+other slots' windows gave up, so the aggregate gain depends on how uneven the slots' acceptance is.
+
 **With a layer split** (e.g. `"layer_split": "24"` on two GPUs, `"parallel": 2`, `--spec 4 --mtp ...`) it works the
 same way, with the slot drafters on the **last stage's GPU** (where the solo drafter and the head are): each slot gets a
 drafter that shares the solo drafter's weights and owns only its K/V ring and buffers (the engine logs `--batch-mtp: N

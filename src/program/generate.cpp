@@ -803,6 +803,9 @@ void usage() {
                  "  --batch-mtp          --batch (opt-in, needs --mtp and --spec): each slot also verifies one MTP proposal per\n"
                  "                       window (STRATA_BATCH_MTP=1 does the same); works on one GPU and on a layer split (the\n"
                  "                       slot drafters sit on the last stage's GPU; not with --batch-groups); needs VRAM per slot\n"
+                 "                       (STRATA_BATCH_MTP_DYNAMIC=1: the window's spare rows follow the slots' acceptance\n"
+                 "                       records - a slot the target has been taking from drafts deeper, a refused-everything\n"
+                 "                       slot keeps only its token row; experimental, measure before keeping it on)\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (on by default for 2+ stages on AMD gfx12;\n"
                  "                       STRATA_PIPELINE_AUTO=0 or N=0 turns it off): one conversation's verify windows\n"
@@ -10001,9 +10004,23 @@ int main(int argc, char** argv) {
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
             static size_t next_slot = 0;
-            // Each MTP slot uses two rows; rotate slots when more than four are active.
+            // STRATA_BATCH_MTP_DYNAMIC=1: the window's rows follow the slots' acceptance records
+            // (strata/program/batch_draft_rows.hpp) instead of the fixed two rows per slot.  Off by default:
+            // the default path stays the 0.1.x window, byte for byte.
+            static const bool dynamic_rows = [] {
+                const char* v = std::getenv("STRATA_BATCH_MTP_DYNAMIC");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            // Each MTP slot uses two rows; rotate slots when more than four are active.  With the dynamic
+            // split every active slot is at least its token row, so the loop's guard is the capacity itself.
             int A = 0;
-            for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxT; ++offset) {
+            int plan[strata::kernels::kVerifyMaxT] = {};
+            bool plan_active[strata::kernels::kVerifyMaxT] = {};
+            int plan_offered[strata::kernels::kVerifyMaxT] = {}, plan_accepted[strata::kernels::kVerifyMaxT] = {};
+            int plan_slots = 0;                          // the slots this window may plan over (the rotation's pick)
+            int candidate[strata::kernels::kVerifyMaxT] = {};
+            for (size_t offset = 0; offset < bs.size() && S + (batch_mtp && !dynamic_rows ? 2 : 1)
+                                       <= strata::kernels::kVerifyMaxT; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
                 if (bs[(size_t) b].active) {
                     first[A] = S;
@@ -10012,7 +10029,7 @@ int main(int argc, char** argv) {
                     tok[S] = bs[(size_t) b].x;
                     pos[S] = bs[(size_t) b].p;
                     ++S;
-                    if (batch_mtp) {
+                    if (batch_mtp && !dynamic_rows) {
                         rows[S] = b;
                         if (!bs[(size_t) b].draft_ready) {
                             err = "batch MTP: a live slot has no draft";
@@ -10020,6 +10037,40 @@ int main(int argc, char** argv) {
                         }
                         tok[S] = bs[(size_t) b].draft[0];
                         pos[S] = bs[(size_t) b].p + 1;
+                        ++S;
+                    }
+                    if (dynamic_rows) {
+                        candidate[plan_slots++] = b;
+                        plan_active[plan_slots - 1] = true;
+                        plan_offered[plan_slots - 1] = bs[(size_t) b].drafts_offered;
+                        plan_accepted[plan_slots - 1] = bs[(size_t) b].drafts_accepted;
+                    }
+                }
+            }
+            if (dynamic_rows && batch_mtp && plan_slots > 0) {
+                strata::program::batch_draft_rows::split(plan, plan_slots, plan_active, plan_offered,
+                                                         plan_accepted, strata::kernels::kVerifyMaxT);
+                // repack the window along the plan: every slot's token row first, then its proposal rows at
+                // consecutive positions (batch_rows_error's layout: a slot's rows are contiguous, positions +1)
+                S = 0;
+                for (int a = 0; a < plan_slots; ++a) {
+                    const int b = candidate[a];
+                    BSlot& sl = bs[(size_t) b];
+                    const int extra = plan[a] - 1;       // rows past the token row are proposals
+                    if (extra > 0 && !sl.draft_ready) {
+                        err = "batch MTP: a live slot has no draft";
+                        return false;
+                    }
+                    first[a] = S;
+                    active[a] = b;
+                    rows[S] = b;
+                    tok[S] = sl.x;
+                    pos[S] = sl.p;
+                    ++S;
+                    for (int j = 0; j < extra; ++j) {    // the draft chain: proposal j continues token + j
+                        rows[S] = b;
+                        tok[S] = sl.draft[j];
+                        pos[S] = sl.p + 1 + j;
                         ++S;
                     }
                 }
@@ -10080,10 +10131,17 @@ int main(int argc, char** argv) {
             std::vector<int> keep(bs.size(), 0);
             for (int a = 0; a < A; ++a) {
                 const int b = active[a], i = first[a];
-                const BSlot& sl = bs[(size_t) b];
-                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
-                keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
-                          sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
+                BSlot& sl = bs[(size_t) b];
+                const int width = batch_mtp ? (dynamic_rows ? plan[a] : 2) : 1;   // this slot's rows in the window
+                int n = 1;
+                for (int j = 1; j < width; ++j) {         // the proposal chain held while the target agrees
+                    if (outb[i + j - 1] != tok[i + j]) break;
+                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i + j - 1])
+                                     != o.eos_ids.end();
+                    if (eos || sl.stop || sl.produced + j + 1 > sl.max_new || sl.p + j + 2 > o.max_context) break;
+                    ++n;
+                }
+                keep[b] = n;
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
                 std::printf("ERR %s\n", err.c_str());
@@ -10095,19 +10153,22 @@ int main(int argc, char** argv) {
             bt_commit += msd(w1, w2);
             ++bt_windows;
             for (int a = 0; a < A; ++a) {
-                bt_rows += keep[active[a]];
-                bt_accepted += keep[active[a]] - 1;
-                // the slot's own tally, for its BDONE: every running slot offers one proposal per window, and
-                // the target took keep-1 of them (0 when it picked its own token over the draft)
-                BSlot& sl = bs[(size_t) active[a]];
-                sl.drafts_offered += batch_mtp ? 1 : 0;
-                sl.drafts_accepted += keep[active[a]] - 1;
+                const int b = active[a];
+                bt_rows += keep[b];
+                bt_accepted += keep[b] - 1;
+                // the slot's own tally, for its BDONE: a slot offers plan[a]-1 proposals this window (the
+                // 0.1.x window: one), and the target took keep-1 of them (0 when it picked its own token)
+                BSlot& sl = bs[(size_t) b];
+                const int offered_now = batch_mtp ? (dynamic_rows ? plan[a] - 1 : 1) : 0;
+                sl.drafts_offered += offered_now;
+                sl.drafts_accepted += keep[b] - 1;
             }
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
                 bool nf = false;   // #879: a row of this slot held non-finite logits: the slot ends, nothing emitted
-                for (int r = first[t]; r < first[t] + (batch_mtp ? 2 : 1); ++r) nf = nf || ver.nonfinite_in(r);
+                const int width = batch_mtp ? (dynamic_rows ? plan[t] : 2) : 1;
+                for (int r = first[t]; r < first[t] + width; ++r) nf = nf || ver.nonfinite_in(r);
                 if (nf) {
                     std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d at position %lld: it ends "
                                          "(BDONE nonfinite) and the next request reads its prompt from token 0\n", b,
@@ -10141,16 +10202,20 @@ int main(int argc, char** argv) {
                     sl.p += 1;
                 }
                 if (batch_mtp && sl.active) {
-                    // The slot's two residual rows (the final residuals of the last stage: ver.final_R_all() follows the
-                    // chain, so with a layer split they are on the last stage's GPU, where the drafters are).  The copy is
-                    // queued on the drafter's own stream after the window's host sync, so the draft graph reads it.
+                    // The slot's window rows' final residuals (the last stage's: ver.final_R_all() follows the
+                    // chain, so with a layer split they are on the last stage's GPU, where the drafters are).
+                    // The copy is queued on the drafter's own stream after the window's host sync, so the draft
+                    // graph reads it.  draft() runs the chain over these rows and drafts past the accepted end:
+                    // the next window gets one proposal per row this window carried for the slot.
                     const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
                     const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                    const int width = dynamic_rows ? plan[t] : 2;
+                    if (dynamic_rows) slot_mtp[(size_t) b]->set_max_drafts(width - 1);   // one proposal per row
                     if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
                                         ver.final_R_all() + (size_t) first[t] * stride,
-                                        2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                        (size_t) width * stride * sizeof(float), cudaMemcpyDeviceToDevice,
                                         slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
-                        !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                        !slot_mtp[(size_t) b]->draft(width, outb + first[t], pos[first[t]], keep[b] - 1,
                                                     sl.draft.data(), err)) {
                         std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
                         return false;

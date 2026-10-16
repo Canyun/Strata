@@ -522,13 +522,17 @@ class SessionOwnership(unittest.TestCase):
         for s in self.PROTECTED:
             self.assertEqual(e.pick_slot(self.prompt(s), "protected"), s)
             self.claim(e, s, self.prompt(s), now)
-        self.assertIsNone(e.pick_slot(self.prompt(3), "protected"))
+        self.assertEqual(e.pick_slot(self.prompt(3), "protected"), 3)   # the free guest slot is its borrow
 
-    def test_a_fourth_conversation_queues_rather_than_taking_an_owned_slot(self):
+    def test_a_fourth_borrows_the_guest_slot_and_a_fifth_queues(self):
+        # every protected slot is a live conversation's: the fourth takes the free guest slot (a one-shot call
+        # would evict whatever sits there anyway), and only when the guest slot is taken too does a request
+        # queue for the window
         e = self.engine(120.0)
         self.fill(e, time.time())
-        self.assertIsNone(e.pick_slot(self.prompt(3), "protected"))
-        self.assertIsNone(e.pick_slot(self.prompt(4), "protected"))
+        self.assertEqual(e.pick_slot(self.prompt(3), "protected"), 3)   # the guest slot is the borrow
+        e.slot_busy[3] = True                                           # the borrow is running
+        self.assertIsNone(e.pick_slot(self.prompt(4), "protected"))     # nothing free: the window it is
 
     def test_a_turn_returns_to_its_own_slot_and_its_own_chain(self):
         e = self.engine(120.0)
@@ -560,7 +564,59 @@ class SessionOwnership(unittest.TestCase):
             self.turn(e, s, s, now, )
         self.assertLess(len(e.slot_held[0]), StrataEngine.SLOT_PROTECT_MIN_TOKENS)
         self.assertFalse(e._slot_locked(0))                    # the lock of the ordering: off at this size
-        self.assertIsNone(e.pick_slot(self.prompt(3, tokens=12692), "protected"))   # ownership: guards it
+        # ownership still guards at this size: the fourth conversation's turn goes to the guest borrow (its
+        # chain keeps), not to a neighbour's owned slot, which the old unguarded routing read from token 0
+        self.assertEqual(e.pick_slot(self.prompt(3, tokens=12692), "protected"), 3)
+
+    def test_a_queuing_conversation_takes_a_free_guest_slot(self):
+        # every protected slot is owned and busy (or another conversation's): rather than queue behind the
+        # window, the newest conversation borrows the guest slot nobody is using - the one-shot calls lose
+        # nothing (the guest zone is theirs again the moment the borrow's turn ends and they take it back)
+        e = self.engine(120.0)
+        self.fill(e, time.time())
+        self.assertEqual(e.pick_slot(self.prompt(3), "protected"), 3)
+
+    def test_a_borrowed_guest_slot_keeps_the_conversation_for_the_grace(self):
+        # the borrow is a real ownership: the next turn returns to the chain it built in the guest slot, instead
+        # of reading the whole prompt again in a protected slot
+        e = self.engine(120.0)
+        now = time.time()
+        self.fill(e, now)
+        first = self.prompt(3)
+        self.assertEqual(e.pick_slot(first, "protected"), 3)
+        self.claim(e, 3, first, now)
+        self.assertEqual(e.slot_owner[3], e._session_key(first))
+        again = self.prompt(3, turn=1)
+        self.assertEqual(e.pick_slot(again, "protected"), 3)   # back to its chain in the borrowed slot
+        # the grace past, the guest zone is the one-shots' again
+        e.slot_used[3] = now - 121.0
+        self.assertEqual(e.pick_slot(list(range(500)), "guest"), 3)
+
+    def test_a_borrowed_guest_slot_does_not_block_the_one_shots_while_free_of_them(self):
+        # the guest zone is the one-shots' own: a one-shot's pick never queues behind the conversations'
+        # ownership - it takes the guest slot the moment no one-shot holds it (the borrow's chain is what a
+        # one-shot call evicts, which is what the guest zone is for)
+        e = self.engine(120.0)
+        now = time.time()
+        self.fill(e, now)
+        self.assertEqual(e.pick_slot(self.prompt(3), "protected"), 3)     # the borrow
+        self.claim(e, 3, self.prompt(3), now)
+        self.assertEqual(e.pick_slot(list(range(500)), "guest"), 3)       # the one-shot walks right in
+
+    def test_a_busy_guest_slot_is_no_borrow(self):
+        # the guest slot is running a one-shot: the conversation queues for the window, as before the borrow
+        e = self.engine(120.0)
+        self.fill(e, time.time())
+        e.slot_busy[3] = True
+        self.assertIsNone(e.pick_slot(self.prompt(3), "protected"))
+
+    def test_the_partition_alone_still_queues_rather_than_borrowing(self):
+        # protected_slots without the ownership window: the guest zone stays sealed (the one-shots' guarantee),
+        # which is the behaviour the partition's own test pins
+        e = engine(4, 1, pipelined=False, protected=[0, 1, 2])
+        for b in (0, 1, 2):
+            e.slot_busy[b] = True
+        self.assertIsNone(e.pick_slot(list(range(100)), "protected"))
 
     def test_a_slot_whose_owner_went_idle_past_the_grace_is_taken(self):
         e = self.engine(120.0)
@@ -570,10 +626,14 @@ class SessionOwnership(unittest.TestCase):
         self.assertEqual(e.pick_slot(self.prompt(3), "protected"), 0)
 
     def test_just_inside_the_grace_still_holds(self):
+        # the owned slot itself keeps its conversation while the grace runs (119 s of the 120): the pick never
+        # displaces a live chain - with the guest borrow taken too, a fourth conversation queues rather than
+        # take slot 0, whose owner was seen 119 s ago
         e = self.engine(120.0)
         now = time.time()
         self.fill(e, now)
         e.slot_used[0] = now - 119.0
+        e.slot_busy[3] = True                                   # the guest slot is a one-shot's
         self.assertIsNone(e.pick_slot(self.prompt(3), "protected"))
 
     def test_the_owner_keeps_its_slot_while_its_turn_runs(self):
@@ -702,6 +762,106 @@ class OwnershipVisible(unittest.TestCase):
                           "started": time.time() - 2, "first_token": time.time() - 1}
         v = e.slots_view()
         self.assertEqual((v[0]["state"], v[0]["owner"], v[0]["owned"]), ("decoding", "s:conv-0", True), v[0])
+
+
+class ShorterWaiting(unittest.TestCase):
+    """#656's give-way reads the queue before it yields the control lines: a waiting request is worth the yield
+    only when it could take a slot once it had the lines - with the ownership window on, a request every slot
+    refuses (the protected zone full of live conversations, the guest slot busy) waits for the window either
+    way, and a read that keeps giving way to it starves them both (the waiter never gets the lines to reach its
+    own queue, the reader never finishes its prompt)."""
+
+    def engine(self, ownership_s=0.0):
+        import threading
+        e = object.__new__(StrataEngine)
+        e.batch = 4
+        e.slot_order = list(range(4))
+        e.slot_busy = [False] * 4
+        e.slot_held = [[] for _ in range(4)]
+        e.slot_used = [0.0] * 4
+        e.slot_gs = 0
+        e.slot_groups = 1
+        e.slot_group = [0] * 4
+        e.slot_cap = [0] * 4
+        e.slot_zone = ["protected", "protected", "protected", "guest"]
+        e.slot_protect_seconds = ownership_s
+        e.slot_owner = [None] * 4
+        e.slot_cv = threading.Condition()
+        with e.slot_cv:
+            e.wait_lens = []
+        return e
+
+    def wait(self, e, plen, zone):
+        with e.slot_cv:
+            e.wait_lens.append([plen, zone])
+
+    def test_a_waiting_request_worth_the_lines(self):
+        # a free protected slot: the waiter would take it, so the lines are worth giving
+        e = self.engine()
+        self.wait(e, 300, "protected")
+        e.slot_busy[0] = e.slot_busy[1] = True
+        self.assertTrue(e._shorter_waiting(1000))
+
+    def test_a_waiter_the_zones_refuse_is_not_worth_the_lines(self):
+        # the ownership window: every protected slot a live conversation's, the guest slot busy - the waiter
+        # would queue anyway, so the read keeps the lines and finishes
+        e = self.engine(120.0)
+        self.wait(e, 300, "protected")
+        for b in (0, 1, 2):
+            e.slot_busy[b] = True
+            e.slot_owner[b] = "s:someone"
+            e.slot_used[b] = time.time()
+        e.slot_busy[3] = True                                          # the guest borrow is running
+        self.assertFalse(e._shorter_waiting(1000))
+
+    def test_a_waiter_takes_a_dead_protected_slot(self):
+        # the grace past, slot 0's conversation is gone (the owner tag survives until someone takes the slot):
+        # the waiter would get it, so the yield is worth it - an owned-alive slot would not be given
+        e = self.engine(120.0)
+        self.wait(e, 300, "protected")
+        for b in (1, 2, 3):
+            e.slot_busy[b] = True
+            e.slot_owner[b] = "s:someone"
+        e.slot_owner[0] = "s:gone"
+        e.slot_used[0] = time.time() - 121.0                           # idle past the grace
+        self.assertTrue(e._shorter_waiting(1000))
+        e.slot_used[0] = time.time()                                   # alive again inside the grace
+        self.assertFalse(e._shorter_waiting(1000))
+
+    def test_a_guest_waiter_takes_a_free_guest_slot(self):
+        e = self.engine(120.0)
+        self.wait(e, 300, "guest")
+        for b in (0, 1, 2):
+            e.slot_busy[b] = True
+        self.assertTrue(e._shorter_waiting(1000))                      # slot 3 is free and the waiter's zone
+
+    def test_a_partitioned_waiter_with_no_window_does_not_take_the_guest_slot(self):
+        # protected_slots alone (no ownership window): the guest zone stays sealed, so a waiter the protected
+        # zone cannot take is not worth the lines - it queues, and the read finishes
+        e = self.engine(0.0)
+        self.wait(e, 300, "protected")
+        for b in (0, 1, 2):
+            e.slot_busy[b] = True
+        self.assertFalse(e._shorter_waiting(1000))
+
+    def test_a_guest_waiter_gets_nothing_when_the_guest_slot_is_busy(self):
+        e = self.engine(120.0)
+        self.wait(e, 300, "guest")
+        for b in (0, 1, 2, 3):
+            e.slot_busy[b] = True
+        self.assertFalse(e._shorter_waiting(1000))
+
+    def test_without_partition_every_free_slot_counts(self):
+        # no protected_slots: slot_zone is empty, a waiter's zone gates nothing, and any free slot is its own
+        e = self.engine(0.0)
+        e.slot_zone = []
+        self.wait(e, 300, "protected")
+        for b in (0, 1, 2):
+            e.slot_busy[b] = True
+        self.assertTrue(e._shorter_waiting(1000))
+        for b in range(4):
+            e.slot_busy[b] = True
+        self.assertFalse(e._shorter_waiting(1000))
 
 
 if __name__ == "__main__":

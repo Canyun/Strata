@@ -1449,10 +1449,12 @@ class StrataEngine:
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
+    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, zone: str = "protected"):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
-        `after_epoch`: a request whose read gave way lets the requests waiting then go first."""
-        entry = [plen]
+        `after_epoch`: a request whose read gave way lets the requests waiting then go first.  `zone`: what the
+        waiting request will pick a slot by once it has the lines - a give-way (#656) is only worth it when the
+        waiter would find a slot (see _shorter_waiting)."""
+        entry = [plen, zone]
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -1504,9 +1506,34 @@ class StrataEngine:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
 
     def _shorter_waiting(self, plen: int) -> bool:
-        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
+        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to.
+
+        "Worth" asks more than the length: the waiter gives way **to a slot** - once it has the lines it picks
+        one, and with the ownership window on a waiter the slots all refuse (the protected zone full of live
+        conversations, the guest slot busy) queues for the window either way.  Yielding the lines to it starves
+        both sides: the waiter never reaches its own queue (and its heartbeat), the reader never finishes its
+        prompt - each give-way restarts the read while the waiter is still waiting for the lines it will not
+        use.  So a waiter counts only when some slot would have it: its zone's own pick, or - for a protected
+        waiter past a full zone - the guest borrow.  (The waiter's session key is its own business; the check
+        reads the slots it could take, not the chain it owns - a conservative ask, never more give-ways.)"""
         with self.slot_cv:
-            return any(e[0] * 2 <= plen for e in self.wait_lens)
+            now = time.time()
+            for entry in self.wait_lens:
+                if entry[0] * 2 > plen:
+                    continue
+                zone = entry[1] if len(entry) > 1 else "protected"
+                for b in self.slot_order:
+                    if self.slot_busy[b]:
+                        continue
+                    z = self.slot_zone[b] if self.slot_zone else zone
+                    if z == zone:
+                        if zone != "protected" or not self._slot_owned_live(b, now):
+                            return True       # its own zone and (protected) nobody live's: the waiter takes it
+                    if (zone == "protected" and z == "guest"
+                            and getattr(self, "slot_protect_seconds", 0.0)
+                            and getattr(self, "slot_owner", None) is not None):
+                        return True          # the borrow: the zone is full, but the guest slot would take it
+        return False
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
@@ -1532,7 +1559,7 @@ class StrataEngine:
         prompt, left = list(ids), int(max_new)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
-        ok = yield from self._take_control(cancel, len(prompt))
+        ok = yield from self._take_control(cancel, len(prompt), zone=zone)
         if not ok:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -1546,7 +1573,7 @@ class StrataEngine:
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
-                    ok = yield from self._take_control(cancel, len(prompt))
+                    ok = yield from self._take_control(cancel, len(prompt), zone=zone)
                     if not ok:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -1659,7 +1686,7 @@ class StrataEngine:
                             if cancel.is_set():
                                 return
                             if not holding:
-                                ok = yield from self._take_control(cancel, len(prompt))
+                                ok = yield from self._take_control(cancel, len(prompt), zone=zone)
                                 if not ok:
                                     return
                                 holding, born = True, self.gen
@@ -1954,6 +1981,17 @@ class StrataEngine:
             unowned = [b for b in free if not self._slot_owned_live(b, now)]
             if unowned:
                 return min(unowned, key=lambda b: (-shared_prefix(b), self.slot_used[b]))
+            # the protected zone is full of live conversations: rather than queue behind the window, borrow a
+            # free guest slot - a one-shot call evicts whatever sits there anyway, so a conversation's chain in
+            # it loses nothing the guest zone was keeping.  The borrow is a real ownership (_note_owner writes
+            # it at admission): the next turn returns to the chain it built there, and past the grace the slot
+            # is the one-shots' again.  `free` was filtered to this request's zone, so the guest zone is read
+            # from all the slots (and `cap` again: the borrow reads only what fits, as any pick does).
+            guest = [b for b in self.slot_order
+                     if not self.slot_busy[b] and (not zones or zones[b] == "guest")
+                     and (not cap or cap[b] <= 0 or cap[b] >= need)]
+            if guest:
+                return min(guest, key=lambda b: (-shared_prefix(b), self.slot_used[b]))
             return None
         gs = getattr(self, "slot_gs", 0)
         if gs:

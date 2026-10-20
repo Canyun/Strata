@@ -20,7 +20,9 @@ from rich.text import Text
 
 from strata_cli import nav
 from strata_cli.client import complete_slots
-from strata_cli.render import (_queue_wait, activity_continuity_notice, activity_label, display_width,
+from strata_cli.render import (_queue_wait, _protect_active, _slot_owner, _slot_protect, _slots_routing,
+                               activity_continuity_notice,
+                               activity_label, display_width,
                                field, group_occupancy, number, safe)
 
 
@@ -618,6 +620,9 @@ def _visual_overview(snapshot: dict, history: MonitorHistory, *, width: int, hei
         context_lines.append(Text("Held is the largest active slot cache; groups are not GPU lanes.", style=dim))
 
     slot_lines: list[Text] = []
+    # the `*` is a window's marker, and only the window puts it there; the line below covers all three slot settings
+    protect_slots = _protect_active(work)
+    routing = _slots_routing(work)
     if slots is None:
         slot_lines.append(Text("Complete slot map unavailable", style=dim))
     else:
@@ -635,13 +640,18 @@ def _visual_overview(snapshot: dict, history: MonitorHistory, *, width: int, hei
             for row in rows[:8]:
                 state = {"reading": "P", "decoding": "D", "idle": "·"}.get(row.get("state"), "?")
                 tint = (amber if state == "P" else green if state == "D" else dim)
+                if protect_slots:
+                    state += _slot_owner(row)
                 line.append(f"[{number(row.get('slot')):>2} {state}] ", style=tint if color else "")
             if len(rows) > 8:
                 line.append(f"+{len(rows) - 8}", style=dim)
             slot_lines.append(line)
         if len(grouped) > 10:
             slot_lines.append(Text(f"+{len(grouped) - 10} groups · press 2", style=dim))
-    slot_lines.insert(0, Text("P prefill   D decode   · idle   |   engine slots", style=dim))
+    slot_lines.insert(0, Text("P prefill   D decode   · idle   |   engine slots"
+                              + ("   * slot held for its conversation" if protect_slots else ""), style=dim))
+    if routing:
+        slot_lines.insert(1, Text(_slot_protect(work), style=violet if color else ""))
     slot_lines.append(Text(f"{_slot_phases(work, False) or 'Slot phases unavailable'}", style=dim))
     slot_lines.append(Text(_replica_batch_line(work, False) if work.get("replica_batches") else
                            f"Oldest queue {number(work.get('oldest_queue_s'), 's', 1)}  ·  "
@@ -842,6 +852,23 @@ def render_dashboard(snapshot: dict, *, width: int, height: int, history: Monito
     phases = _slot_phases(work, compact)
     if phases:
         batch.append(phases.replace("Phases  ", "") if compact else phases)
+    # the window is the only thing that explains an idle slot a conversation is keeping, so the batching panel
+    # names it; the trends under it are the part that gives up a row when the line goes in.  A server that reserves
+    # slots of the batch, or refuses a full one, is named on the same line with the window off.
+    if _slots_routing(work):
+        line = ""
+        if _protect_active(work):
+            holders = work.get("slot_holders")
+            holders = holders if type(holders) is int and holders >= 0 else None
+            line = (f"Protect {number(work.get('slot_protect_seconds'), 's', 0)}  "
+                    f"held {number(holders) if holders is not None else '--'}/"
+                    f"{number(work.get('slots_effective'))}")
+        reserved = work.get("protected_slots")
+        if type(reserved) is int and reserved > 0:
+            line += f"{'  ' if line else ''}reserved {number(reserved)} for named conversations"
+        if work.get("reject_when_full") is True:
+            line += f"{'  ' if line else ''}refused {number(work.get('slot_refusals'))}"
+        batch.append(line + ("" if compact else "  ·  a held slot reads idle"))
     batch += _groups(work, compact, glyphs)
     if not compact:
         stages = (work.get("stage_in_flight") or []) if _current_sample(work, "stage_sample_age_s") else []

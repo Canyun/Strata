@@ -185,6 +185,40 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
   engine copies its state back (50-60 ms for a short conversation) instead of reading the history again - also for
   a client that drops the reply's thinking from the history (the checkpoint matches up to the new turn). A new
   conversation takes an empty slot, else the one used longest ago.
+- **A conversation can keep its slot** (opt-in: `"slot_protect_seconds": 120` in the config). The cache above is a
+  preference: with every slot free the pick only prefers the slot holding the prompt's start, and a conversation
+  whose next turn lands on a neighbour's slot drops what that neighbour held - turn after turn, both conversations
+  read their whole prompt again. With the window set, a slot belongs for that many seconds to the conversation that
+  last used it, and it is closed to the others: its next turn goes back to the chain in that slot, a second request
+  of a conversation whose slot is decoding waits for that slot, and nothing else enters the slot until the window
+  passes - not a request that matches the tokens it holds. Past the window the slot is free for the next
+  conversation.
+  The routing reads one field of the request, `"strata_session"`, the id a client gives its conversation; a request
+  that sends no `strata_session` never enters a slot a conversation holds. The window is the switch: absent or 0,
+  nothing changes at all.
+  An agent client is the case this is for: it rewrites its own prompt start between turns (a memory snapshot, a
+  working directory, a timestamp), so the id it names is what keeps a conversation on one slot. It should send the
+  same id on every turn of one conversation, and a different one per conversation. A client that sends no
+  `strata_session` (most agent harnesses) is unaffected by the routing, and one that probes the server once should
+  not send an id at all: it would hold a slot for the window with nothing to bring back.
+- **Some slots can be kept for conversations** (opt-in: `"protected_slots": 2`). The window keeps a conversation on
+  its own slot, and a stream of one-shot requests (no `strata_session`) still spreads over the whole batch and
+  lands on a conversation's slot the moment its window passes. A count reserves that many slots from the start of
+  the batch for the requests that do name a conversation; the rest serve everything else, and the two sides never
+  cross. A list works too (`[0,3]`, `"0,3"`). Absent, empty, or all of the batch: no split.
+- **A full server can answer instead of queueing** (opt-in: `"reject_when_full": true`). The slots above fill up:
+  a conversation beyond the last reserved slot, and a second request of a conversation whose turn is decoding, both
+  wait a whole turn for a slot, sending nothing while they do. With this set, the slots are read once before the
+  answer starts and a request that finds no slot is answered `429` with a `Retry-After` (the same answer arrives
+  inside a stream that starts, and as the engine's own refusal when a request loses its slot a moment after being
+  admitted). Off, which is the default, the queue is exactly as it was.
+- The three are set in the model's config (`"slot_protect_seconds"`, `"protected_slots"`, `"reject_when_full"`), for one run with `strata serve --slot-protect-seconds SECONDS --protected-slots N --reject-when-full on|off`, or saved in a profile (`profile set NAME slot_protect_seconds=120 protected_slots=2 reject_when_full=true`). A flag given on a run replaces the saved value; the seconds and the split are cancelled by `0` or `off`, the refusal by `off`. A split is checked against the slots the run asks the engine for: protecting every slot of a batch, or a slot the batch does not have, is refused (the first leaves the traffic that names nothing with nowhere to go, the second routes nothing). The server prints what it understood once, at the start.
+- The Monitor shows all three: the Serving pane marks a slot closed to other conversations with `*`, and names the
+  window, how many slots are held, how many are reserved and how many requests were refused
+  (`strata status --json` -> `work.slots` -> `owner`, `owned`, `zone`). `/metrics` carries the same fields
+  (`live.slots` -> `owner`, `owned`, `zone`; `live.slot_protect_seconds`, `slot_holders`, `protected_slots`,
+  `reject_when_full`, `slot_refusals`), and Prometheus exports `strata:live_slot_protect_seconds`,
+  `strata:live_slot_holders` and `strata:live_slot_refusals`.
 - Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
 

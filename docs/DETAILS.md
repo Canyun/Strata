@@ -1144,6 +1144,20 @@ follows the reused prefix (or the root) is read in one run, and its session is n
 It still starts from a checkpoint it matches, and still saves the system-prompt root when that reaches
 `--prompt-cache-root`. Without the field (or with `true`) nothing changes.
 
+**A conversation can keep its batch slot** (opt-in: `"slot_protect_seconds": 120` in the config, with
+`"parallel"` above 1). A request can name its conversation with `"strata_session": "id"` in its body; with the
+window set, the slot a conversation was admitted to stays its owner's for that many seconds - its next turn returns
+to the chain in that slot, and the slot is closed to every other request inside the window, including one whose
+prompt matches the tokens it holds (that is the case that evicted the chain). Past the window the slot is free. A
+client that rewrites its prompt start between turns (a memory snapshot, a timestamp, a trimmed history) needs this:
+what the routing matches on is the id, not the prompt. A request that names no conversation never enters a slot a
+conversation holds. Absent window (or 0) nothing changes at all. `"protected_slots": 2` reserves that many slots of
+the batch for the requests that name a conversation, and keeps the traffic that names nothing out of them, so a
+stream of one-shot calls cannot displace a conversation's chain when its window passes. `"reject_when_full": true`
+answers a request that finds no slot with `429` and a `Retry-After` instead of queueing it for a whole turn. The
+slot queue keeps a waiting request's stream alive (a keep-alive every 10 s), and `/metrics` shows each slot's owner,
+whether the window is open on it, and which kind of request it serves. See [BATCHING.md](BATCHING.md).
+
 **Checkpoints spread back from the end (opt-in, `--prompt-cache-spread`).** Least recent use keeps the newest points:
 every turn adds a checkpoint at its start, so after a few short turns the 6 sit within the last 1-2K tokens. An agent
 client that rewrites its history a few thousand tokens back (it trims an old tool output, drops a step) then matches

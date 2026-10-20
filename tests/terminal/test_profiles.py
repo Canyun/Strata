@@ -429,6 +429,92 @@ class OperatorProfileTests(unittest.TestCase):
         self.assertFalse(result["plan"]["would_write_config"])
         self.assertEqual(self.config.read_bytes(), before)
 
+    def test_serve_plan_checks_the_slot_routing_against_the_slots_of_the_run(self):
+        """The slot routing settings are profile overrides like parallel, and the split is checked against the slots
+        the run asks for: 6 protected slots of a run asking 4 name slots that will not exist, so the plan refuses
+        them (the server would refuse the flags, and a plan that launches is a promise)."""
+        profiles.create("local", str(self.config))
+        profiles.set_values("local", ["parallel=8", "slot_protect_seconds=120", "protected_slots=6",
+                                      "reject_when_full=true"])
+        with mock.patch("serve.server.main", side_effect=AssertionError("server started")):
+            code, planned = self.command("serve", "--profile", "local", "--plan", "--output", "json")
+        self.assertEqual(code, 0)
+        plan = planned["plan"]
+        self.assertEqual(plan["effective"]["slot_protect_seconds"], 120.0)
+        self.assertEqual(plan["effective"]["protected_slots"], "6")
+        self.assertTrue(plan["effective"]["reject_when_full"])
+        self.assertEqual(plan["origin"]["slot_protect_seconds"], "saved_profile")
+        self.assertEqual(plan["server_argv"][plan["server_argv"].index("--slot-protect-seconds") + 1], "120.0")
+        self.assertEqual(plan["server_argv"][plan["server_argv"].index("--protected-slots") + 1], "6")
+        self.assertEqual(plan["server_argv"][plan["server_argv"].index("--reject-when-full") + 1], "on")
+        profiles.set_values("local", ["parallel=4"])
+        code, refused = self.command("serve", "--profile", "local", "--plan", "--output", "json")
+        self.assertEqual(code, 2)
+        self.assertIn("4 slots (0..3)", refused["error"]["message"])
+        profiles.set_values("local", ["parallel=8"])
+        for flag, value in (("--protected-slots", "0,a"), ("--slot-protect-seconds", "-1"),
+                            ("--slot-protect-seconds", "abc")):
+            code, refused = self.command("serve", "--profile", "local", flag, value, "--plan", "--output", "json")
+            self.assertEqual(code, 2, (flag, value))
+            self.assertIn(flag, refused["error"]["message"])
+        code, planned = self.command("serve", "--profile", "local", "--slot-protect-seconds", "off",
+                                     "--protected-slots", "none", "--reject-when-full", "off",
+                                     "--plan", "--output", "json")
+        self.assertEqual(code, 0)
+        argv = planned["plan"]["server_argv"]
+        self.assertEqual(argv[argv.index("--slot-protect-seconds") + 1], "0.0")
+        self.assertEqual(argv[argv.index("--protected-slots") + 1], "0")
+        self.assertEqual(argv[argv.index("--reject-when-full") + 1], "off")
+        self.assertEqual(planned["plan"]["effective"]["protected_slots"], "0")
+        self.assertFalse(planned["plan"]["effective"]["reject_when_full"])
+        code, planned = self.command("serve", "--profile", "local", "--reject-when-full",
+                                     "--plan", "--output", "json")
+        self.assertEqual(code, 0)
+        self.assertEqual(planned["plan"]["server_argv"][
+                         planned["plan"]["server_argv"].index("--reject-when-full") + 1], "on")
+        code, refused = self.command("serve", "--profile", "local", "--reject-when-full", "yes",
+                                     "--plan", "--output", "json")
+        self.assertEqual(code, 2)
+        self.assertIn("--reject-when-full", refused["error"]["message"])
+
+    def test_a_slot_routing_override_says_nothing_when_it_is_not_set(self):
+        # an override left out is not a switch turned off: the run config's value (and the default) stay in place,
+        # and the plan says no flag - passing --reject-when-full off because the profile is silent would cancel a
+        # value the operator saved in the run config itself
+        profiles.create("local", str(self.config))
+        cfg = json.loads(self.config.read_text())
+        cfg["slot_protect_seconds"] = 90
+        self.config.write_text(json.dumps(cfg))
+        with mock.patch("serve.server.main", side_effect=AssertionError("server started")):
+            code, planned = self.command("serve", "--profile", "local", "--plan", "--output", "json")
+        self.assertEqual(code, 0)
+        self.assertEqual(planned["plan"]["effective"]["slot_protect_seconds"], 90)
+        self.assertEqual(planned["plan"]["origin"]["slot_protect_seconds"], "run_config")
+        for flag in ("--slot-protect-seconds", "--protected-slots", "--reject-when-full"):
+            self.assertNotIn(flag, planned["plan"]["server_argv"])
+        profiles.set_values("local", ["slot_protect_seconds=0"])
+        with mock.patch("serve.server.main", side_effect=AssertionError("server started")):
+            code, planned = self.command("serve", "--profile", "local", "--plan", "--output", "json")
+        self.assertEqual(code, 0)
+        self.assertEqual(planned["plan"]["origin"]["slot_protect_seconds"], "saved_profile")
+        self.assertEqual(planned["plan"]["server_argv"][
+                         planned["plan"]["server_argv"].index("--slot-protect-seconds") + 1], "0.0")
+
+    def test_slot_routing_values_the_server_cannot_run_are_refused_as_overrides(self):
+        for number, assignment in enumerate(("slot_protect_seconds=-1", "slot_protect_seconds=abc",
+                                             "slot_protect_seconds=nan", "protected_slots=2.5",
+                                             "protected_slots=off", "reject_when_full=yes")):
+            name = f"slotx{number}"
+            profiles.create(name, str(self.config))
+            with self.assertRaises(profiles.ProfileError, msg=assignment):
+                profiles.set_values(name, [assignment])
+
+    def test_a_split_naming_a_slot_of_its_own_is_kept(self):
+        profiles.create("slots", str(self.config))
+        profiles.set_values("slots", ["protected_slots=0,2", "slot_protect_seconds=90"])
+        self.assertEqual(profiles.load("slots")[0]["overrides"],
+                         {"protected_slots": "0,2", "slot_protect_seconds": 90.0})
+
     def test_invalid_profile_names_and_types_do_not_escape_store(self):
         for name in ("../outside", "UPPER", "a/b", ".hidden"):
             with self.assertRaises(profiles.ProfileError):

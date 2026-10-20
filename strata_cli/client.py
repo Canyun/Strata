@@ -169,15 +169,19 @@ def _object(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _rows(value: Any, fields: tuple[str, ...], limit: int) -> list[dict]:
+def _rows(value: Any, fields: tuple[str, ...], limit: int, bools: tuple[str, ...] = ()) -> list[dict]:
+    """Keep the listed fields, with text bounded, everything else numeric and the named flags strictly boolean."""
     if not isinstance(value, list):
         return []
     out = []
     for item in value[:limit]:
         if not isinstance(item, dict):
             continue
-        out.append({key: _short(item.get(key)) if key in ("id", "request_id", "state", "name", "finish")
-                    else _number(item.get(key)) for key in fields})
+        row = {key: _short(item.get(key)) if key in ("id", "request_id", "state", "name", "finish", "owner", "zone")
+               else _number(item.get(key)) for key in fields}
+        for key in bools:
+            row[key] = item.get(key) is True
+        out.append(row)
     return out
 
 
@@ -379,7 +383,8 @@ def sanitize_telemetry(raw: dict[str, Any]) -> dict[str, Any]:
         stages = []
     stage_sample = None if replica_mode else _stage_sample(work, len(stages))
     safe_slots = _rows(work.get("slots"), ("slot", "group", "replica", "request_id", "state", "held_tokens",
-                                               "prompt_tokens", "prompt_read", "generated", "elapsed_s", "tok_s"), 64)
+                                               "prompt_tokens", "prompt_read", "generated", "elapsed_s", "tok_s",
+                                               "owner", "zone"), 64, bools=("owned",))
     for row in safe_slots:
         replica = row.get("replica")
         row["replica"] = replica if type(replica) is int and 0 <= replica < 16 else None
@@ -404,6 +409,8 @@ def sanitize_telemetry(raw: dict[str, Any]) -> dict[str, Any]:
                   "context": _number(model.get("context"))},
         "work": {**{k: _number(work.get(k)) for k in ("slots_requested", "slots_effective", "active", "queued",
                                                        "waiting", "outside_slots", "groups",
+                                                       "slot_protect_seconds", "slot_holders", "protected_slots",
+                                                       "slot_refusals",
                                                        "requests_omitted", "max_queue", "admission_limit",
                                                        "admission_reserved", "admission_rejected", "oldest_queue_s",
                                                        "queue_timeout_s", "queue_timeouts",
@@ -415,6 +422,9 @@ def sanitize_telemetry(raw: dict[str, Any]) -> dict[str, Any]:
                  **(stage_sample or {"stage_in_flight": [], "stage_sample_span_s": None,
                                     "stage_sample_age_s": None}),
                  "occupied_slots": occupied_slots,
+                 # "reject_when_full" is a flag, not a number: it says whether a 429 with a Retry-After is what a
+                 # full server answers, which is the one thing the queue's own fields cannot show
+                 "reject_when_full": work.get("reject_when_full") is True,
                  "replica_batches": replica_batches,
                  "replica_stage_samples": replica_stage_samples,
                  "slots": safe_slots,
@@ -472,7 +482,8 @@ def normalize_legacy(metrics: dict[str, Any], status: dict[str, Any]) -> dict[st
     for row in slots[:64]:
         if isinstance(row, dict):
             safe_slots.append({k: row.get(k) for k in ("slot", "group", "replica", "request_id", "state", "held_tokens",
-                                                       "prompt_tokens", "prompt_read", "generated", "elapsed_s", "tok_s")})
+                                                       "prompt_tokens", "prompt_read", "generated", "elapsed_s", "tok_s",
+                                                       "owner", "owned", "zone")})
     effective_slots = _number(concurrency.get("serving"))
     reported_slots = complete_slots({"slots": safe_slots, "slots_effective": effective_slots})
     safe_devices = []
@@ -507,6 +518,13 @@ def normalize_legacy(metrics: dict[str, Any], status: dict[str, Any]) -> dict[st
                                         if reported_slots is not None else None),
                      "queued": _number(live.get("queued")), "waiting": _number(live.get("waiting")),
                      "outside_slots": _number(live.get("outside_slots")), "slots": safe_slots,
+                     # "slot_protect_seconds" is on the old server too (serve/server.py writes it into live), so the
+                     # adapter carries it: the panel shows who holds a slot against the window it is held for.
+                     "slot_protect_seconds": _number(live.get("slot_protect_seconds")),
+                     "slot_holders": _number(live.get("slot_holders")),
+                     "protected_slots": _number(live.get("protected_slots")),
+                     "slot_refusals": _number(live.get("slot_refusals")),
+                     "reject_when_full": live.get("reject_when_full") is True,
                      "groups": _number(engine.get("batch_groups")), "effective_rows_window": None,
                      "batch_active_rows_window": None, "batch_sample_windows": None,
                      "batch_sample_rows": None, "batch_sample_active_rows": None,

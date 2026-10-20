@@ -52,6 +52,10 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int)
     serve.add_argument("--parallel", type=int, help="requested concurrent engine slots")
     serve.add_argument("--batch-groups", help="requested pipeline groups (auto or positive integer)")
+    serve.add_argument("--slot-protect-seconds", help="seconds a batch slot stays its conversation's (0/off for the plain pick)")
+    serve.add_argument("--protected-slots", help="slots of the batch kept for requests that name a conversation (a count, or a list of slot numbers)")
+    serve.add_argument("--reject-when-full", nargs="?", const="on", default=None, metavar="on|off",
+                      help="answer 429 to a request that finds no batch slot, instead of queueing it (on bare, off keeps the queue)")
     serve.add_argument("--max-queue", type=int, help="maximum pending inference calls beyond effective slots")
     serve.add_argument("--queue-timeout", type=float, help="seconds to wait for the first engine turn (0.1..600)")
     serve.add_argument("--batch-telemetry", action=argparse.BooleanOptionalAction, default=None,
@@ -740,14 +744,51 @@ def _redact_argv(args: list[str]) -> list[str]:
     return out
 
 
+def _slot_routing_values(cli: argparse.Namespace) -> dict:
+    """The slot routing flags of a serve command, in the form a plan and a server read: seconds as a number (a word
+    that means "not this run" as 0, which is why the flag is typed when a profile saved a window), a split as
+    digits (an off word as 0, which is what "no split" is spelled as in a config), the refusal as a Boolean (one
+    flag answers both ways, off being why it is typed at all).  The store keeps canonical values, so a plan prints
+    what the server is told and a profile never holds a word.  A value that cannot be run is ValueError naming the
+    flag it was read from, which is what an operator at a terminal can act on.  serve.server is imported here, not
+    at the top: the terminal's start stays light, as for every other lazy serve import in this module."""
+    from serve.server import SLOT_OFF, refusal_of, slot_seconds_value
+    out: dict = {}
+    seconds = getattr(cli, "slot_protect_seconds", None)
+    if seconds is not None:
+        try:
+            out["slot_protect_seconds"] = slot_seconds_value(seconds)
+        except ValueError as e:
+            raise ValueError(f"--slot-protect-seconds: {e}") from None
+    slots = getattr(cli, "protected_slots", None)
+    if slots is not None:
+        raw = str(slots).strip()
+        raw = "0" if raw.lower() in SLOT_OFF else raw
+        try:
+            profiles.validate_overrides({"protected_slots": raw})
+        except ValueError as e:
+            raise ValueError(f"--protected-slots: {e}") from None
+        out["protected_slots"] = raw
+    reject = getattr(cli, "reject_when_full", None)
+    if reject is not None:
+        try:
+            out["reject_when_full"] = refusal_of(reject)
+        except ValueError as e:
+            raise ValueError(f"--reject-when-full: {e}") from None
+    return out
+
+
 def _effective(cfg: dict, saved: dict | None, cli: argparse.Namespace | None = None) -> tuple[dict, dict]:
     overrides = saved["overrides"] if saved else {}
     values = {}
     origins = {}
+    flags = _slot_routing_values(cli) if cli is not None else {}
     for key, default in (("host", "127.0.0.1"), ("port", 8095), ("parallel", None),
                          ("batch_groups", None), ("max_queue", None), ("queue_timeout", None),
+                         ("slot_protect_seconds", None), ("protected_slots", None), ("reject_when_full", None),
                          ("offline", False), ("batch_telemetry", False)):
-        explicit = getattr(cli, key, None) if cli is not None else None
+        explicit = flags.get(key) if key in ("slot_protect_seconds", "protected_slots", "reject_when_full") \
+            else (getattr(cli, key, None) if cli is not None else None)
         if key == "offline" and explicit is False:
             explicit = None
         if explicit is not None:
@@ -763,6 +804,7 @@ def _effective(cfg: dict, saved: dict | None, cli: argparse.Namespace | None = N
         values[key], origins[key] = value, origin
     profiles.validate_overrides({key: value for key, value in values.items() if key in
                                   ("host", "port", "parallel", "batch_groups", "max_queue", "queue_timeout",
+                                   "slot_protect_seconds", "protected_slots", "reject_when_full",
                                    "offline", "batch_telemetry")
                                   and value is not None})
     if values["queue_timeout"] is not None and values["max_queue"] is None:
@@ -772,6 +814,16 @@ def _effective(cfg: dict, saved: dict | None, cli: argparse.Namespace | None = N
             raise ProfileError("parallel override conflicts with --batch/--slots in run config args")
     if values["batch_groups"] is not None and "--batch-groups" in cfg["args"]:
         raise ProfileError("batch_groups override conflicts with --batch-groups in run config args")
+    if values["protected_slots"] is not None:
+        # a split counts the slots of this run, so it is checked against them: the server refuses the flag, and a
+        # plan that launches would be a promise the server breaks.  serve.server is imported here, not at the top:
+        # the terminal's start stays light, the same reason every other serve.server import in this module is here
+        from serve.server import engine_slots_of, slot_split_problem
+        asked = values["parallel"] if values["parallel"] is not None else cfg.get("parallel")
+        problem = slot_split_problem(values["protected_slots"],
+                                     engine_slots_of({**cfg, "parallel": asked}), "protected_slots")
+        if problem:
+            raise ProfileError(problem)
     if values["offline"] and (cfg.get("mcp_servers") or cfg.get("before_load")):
         raise ProfileError("offline serving requires MCP servers and before_load to be absent")
     return values, origins
@@ -794,9 +846,14 @@ def _launch_plan(ref: str, cli: argparse.Namespace | None = None) -> tuple[dict,
     if cli is not None:
         server_args += ["--shutdown-timeout", str(cli.shutdown_timeout)]
     for key, flag in (("parallel", "--parallel"), ("batch_groups", "--batch-groups"),
-                      ("max_queue", "--max-queue"), ("queue_timeout", "--queue-timeout")):
+                      ("max_queue", "--max-queue"), ("queue_timeout", "--queue-timeout"),
+                      ("slot_protect_seconds", "--slot-protect-seconds"), ("protected_slots", "--protected-slots"),
+                      ("reject_when_full", "--reject-when-full")):
         if values[key] is not None and origins[key] != "run_config":
-            server_args += [flag, str(values[key])]
+            # a switch is said in the words its flag reads (on/off) and not in Python's, so the plan is text the
+            # operator can copy and paste
+            said = ("on" if values[key] else "off") if isinstance(values[key], bool) else str(values[key])
+            server_args += [flag, said]
     if values["offline"]:
         server_args.append("--offline")
     if origins["batch_telemetry"] not in ("run_config", "default"):
@@ -924,6 +981,14 @@ def _serve(a: argparse.Namespace) -> int:
     if a.queue_timeout is not None and (not math.isfinite(a.queue_timeout)
                                         or not 0.1 <= a.queue_timeout <= 600):
         return _serve_error(a, "--queue-timeout must be finite seconds in 0.1..600")
+    if a.slot_protect_seconds is not None or a.protected_slots is not None:
+        # the same numbers a saved profile is checked against, and the same canonical words: a plan that launches is
+        # a promise, so a flag the server would refuse has to stop here.  The split of a batch is checked against
+        # the slots of the run by the plan below, which is where the slot count is known
+        try:
+            profiles.validate_overrides(_slot_routing_values(a))
+        except (ProfileError, ValueError) as exc:
+            return _serve_error(a, str(exc))
     if not 0 <= a.shutdown_timeout <= 300:
         return _serve_error(a, "--shutdown-timeout must be in 0..300 seconds")
     try:

@@ -18,8 +18,9 @@ from strata_cli.client import complete_slots
 from strata_cli.dashboard import (set_ascii_boxes, _rounded, _age, _current_batch_value, _current_sample,
                                   _device_role, _gib, _meter, _rate_spark, _spark,
                                   _state, _visual_pair, _visual_panel, MonitorHistory)
-from strata_cli.render import (VIEWS, _device_stage, _queue_wait, _recent_detail,
-                               _request_detail, _slot_detail, activity_continuity_notice,
+from strata_cli.render import (VIEWS, _device_stage, _protect_active, _queue_wait, _recent_detail,
+                               _request_detail, _slot_detail, _slot_owner, _slot_protect, _slots_routing,
+                               activity_continuity_notice,
                                activity_label, activity_rows, field, number,
                                request_rows, safe)
 
@@ -196,9 +197,15 @@ def _serving(snapshot: dict, history: MonitorHistory, *, heights: tuple[int, int
                                     max(1, low_h - 5))
     slot_lines = [_txt("  SLOT  GROUP  STATE       REQUEST      HELD / CONTEXT     SLOT/s", "dim")]
     context = (snapshot.get("model") or {}).get("context")
+    # A short panel is the slot rows' only room; the window line goes in where it costs a row of slots, and the
+    # rows themselves are the point of the pane, so the line appears only when there are rows to spare.
+    protect = _slot_protect(work) if _slots_routing(work) and len(slot_shown) >= 3 else ""
+    if protect:
+        slot_lines.insert(0, _txt(protect, palette["violet"] if color else "dim"))
+    owner_mark = _slot_owner if _protect_active(work) else (lambda row: " ")
     for i, row in enumerate(slot_shown, slot_start):
         mark = "▸" if pane == "groups" and i == selected else " "
-        slot_lines.append(_txt(f"{mark} S{number(row.get('slot')):<4} "
+        slot_lines.append(_txt(f"{mark}{owner_mark(row)}S{number(row.get('slot')):<4} "
                                f"G{number(row.get('group')):<5} {safe(row.get('state'), 10):<11} "
                                f"{field(row.get('request_id'), 12)} "
                                f"{number(row.get('held_tokens')):>6}/{number(context):<7} "

@@ -96,6 +96,37 @@ class Units(unittest.TestCase):
         self.assertNotIn(("strata:gpu_power_watts", lab + ',gpu="0"'), got)   # not measured: no sample
         self.assertEqual(got[("strata:ram_total_bytes", lab)], 64 << 30)
 
+    def test_the_slot_window_is_a_metric_only_when_it_is_set(self):
+        base = {"engine": {"model": "m", "max_context": 1000},
+                "live": {"state": "idle", "queued": 0,
+                         "slots": [{"slot": 0, "state": "idle", "owner": "conv-a", "owned": True},
+                                   {"slot": 1, "state": "idle", "owner": None, "owned": False}]},
+                "totals": {"requests": 0}}
+        lab = 'model_name="m"'
+        windowed = parse(render({**base, "live": {**base["live"], "slot_protect_seconds": 120.0,
+                                                  "slot_holders": 1}}, Latencies().snapshot()))
+        self.assertEqual(windowed[("strata:live_slot_protect_seconds", lab)], 120.0)
+        self.assertEqual(windowed[("strata:live_slot_holders", lab)], 1)
+        self.assertEqual(windowed[("strata:live_slots", lab + ',state="idle"')], 2)
+        off = parse(render(base, Latencies().snapshot()))
+        self.assertNotIn(("strata:live_slot_protect_seconds", lab), off)   # no window: no sample, no zero claim
+        self.assertNotIn(("strata:live_slot_holders", lab), off)
+
+    def test_the_split_and_the_refusals_are_metrics_only_when_they_are_set(self):
+        base = {"engine": {"model": "m", "max_context": 1000},
+                "live": {"state": "idle", "queued": 0,
+                         "slots": [{"slot": 0, "state": "idle", "zone": "protected"},
+                                   {"slot": 1, "state": "idle", "zone": "public"}]},
+                "totals": {"requests": 0}}
+        lab = 'model_name="m"'
+        split = parse(render({**base, "live": {**base["live"], "protected_slots": 1, "slot_refusals": 3}},
+                             Latencies().snapshot()))
+        self.assertEqual(split[("strata:live_protected_slots", lab)], 1)
+        self.assertEqual(split[("strata:live_slot_refusals", lab)], 3)
+        off = parse(render(base, Latencies().snapshot()))
+        self.assertNotIn(("strata:live_protected_slots", lab), off)
+        self.assertNotIn(("strata:live_slot_refusals", lab), off)
+
 
 class Endpoint(unittest.TestCase):
     @classmethod

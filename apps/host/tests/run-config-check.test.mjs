@@ -70,6 +70,18 @@ test('a bad value is an error that names the key, the line, what is allowed and 
   assert.ok(result.issues.filter(i => i.level === 'error').every(i => i.message.length > 20));
 });
 
+test('the batch slot routing keys are known and checked in the words the server reads', () => {
+  const good = '{"slot_protect_seconds": 120, "protected_slots": "0,2", "reject_when_full": true}';
+  assert.deepEqual(checkRunConfig(good), { ok: true, issues: [] });
+  assert.deepEqual(checkRunConfig('{"slot_protect_seconds": null, "protected_slots": null, "reject_when_full": null}'), { ok: true, issues: [] });
+  const by = (text, key) => checkRunConfig(text).issues.filter(i => i.key === key).map(i => i.code);
+  assert.deepEqual(by('{"slot_protect_seconds": -1}', 'slot_protect_seconds'), ['number-range']);
+  assert.deepEqual(by('{"reject_when_full": "yes"}', 'reject_when_full'), ['bool']);
+  // a count of slots ("2") and text naming them ("0,2") are what serve reads; a number with a fraction is neither
+  assert.deepEqual(by('{"protected_slots": "0,a"}', 'protected_slots'), ['text']);
+  assert.deepEqual(by('{"protected_slots": 2.5}', 'protected_slots'), ['text']);
+});
+
 test('null and empty values mean "use the default" and are never an error', () => {
   assert.deepEqual(checkRunConfig('{"parallel": null, "lazy_load": null, "reasoning_budget_tokens": ""}'), { ok: true, issues: [] });
 });

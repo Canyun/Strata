@@ -135,6 +135,21 @@ def strata(m: dict, out: list, lab: str):
         if isinstance(slots, list) and slots:
             metric("live_slots", "gauge", "The batch slots in each state (live.slots).",
                    sum(1 for x in slots if isinstance(x, dict) and x.get("state") == state), f',state="{state}"')
+    # "slot_protect_seconds" is on only when the window is set: a dashboard needs the window and how many slots
+    # are held, because a held slot counts as idle above and nothing else separates it from a free slot.
+    metric("live_slot_protect_seconds", "gauge", "The slot ownership window in seconds (live.slot_protect_seconds).",
+           live.get("slot_protect_seconds"))
+    metric("live_slot_holders", "gauge", "Slots a conversation holds inside the window (live.slot_holders).",
+           live.get("slot_holders"))
+    # the two other slot settings report themselves the same way: their fields are in live only when the setting is
+    # on, so a server that runs without them exports no sample rather than a zero that reads like a measurement
+    metric("live_protected_slots", "gauge",
+           "Batch slots reserved for conversations that name themselves (live.protected_slots).",
+           live.get("protected_slots"))
+    metric("live_slot_refusals", "counter",
+           "Requests refused because no batch slot could take them: a 429, or a slots_full error inside a stream "
+           "that had already started (live.slot_refusals).",
+           live.get("slot_refusals"))
     metric("engine_max_context", "gauge", "The engine's context (engine.max_context).", eng.get("max_context"))
     metric("totals_prompt_seconds_total", "counter", "Time spent reading prompts (totals.prompt_ms).",
            round((totals.get("prompt_ms") or 0) / 1000, 3))

@@ -298,6 +298,38 @@ class ReplicaEngine:
             base += max(1, n)
         return out
 
+    def slot_rejection(self, session: str | None) -> tuple[str, float] | None:
+        """Every replica asked the way the router will route: None when any of them can take the request now, else
+        the shortest of the waits they answer with.  Asking one engine (the router's current) is what refuses a
+        request the next replica has a free slot for."""
+        answers = [e.slot_rejection(session) for e in self.engines if hasattr(e, "slot_rejection")]
+        if any(a is None for a in answers):
+            return None
+        return min(answers, key=lambda a: a[1])
+
+    def slot_reject_full(self) -> bool:
+        """Does any replica refuse a full batch instead of queueing it?  The setting is read from the config per
+        replica, so a server that set it on one card answers 429."""
+        return any(getattr(e, "slot_reject_full", False) for e in self.engines)
+
+    @property
+    def slot_protect_seconds(self) -> float:
+        """The protect window any replica runs with, as the server reports it: a card that holds its slots for two
+        minutes is a server that holds slots, whatever the others do, and the panel has one row for the server."""
+        return max((float(getattr(e, "slot_protect_seconds", 0.0) or 0.0) for e in self.engines), default=0.0)
+
+    @property
+    def slot_zone(self) -> list:
+        """The slot split of the whole server, slot by slot, in the same order the panel shows them (replica 0's
+        slots, then replica 1's).  A replica with no split contributes empty entries: its slots serve every request,
+        and counting them as a split would show the operator slots that are open."""
+        out: list = []
+        for e in self.engines:
+            zones = getattr(e, "slot_zone", None) or []
+            n = int(getattr(e, "batch", 0) or 0)
+            out.extend(zones[b] if b < len(zones) else None for b in range(max(1, n)))
+        return out
+
     def replica_view(self) -> list[dict]:
         """For /metrics: each replica's state, requests running, and requests routed to it so far."""
         return [{"replica": k, "alive": e.alive(), "running": self.inflight[k], "routed": self.routed[k],

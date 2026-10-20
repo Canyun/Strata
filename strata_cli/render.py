@@ -326,12 +326,68 @@ def _device_detail(row: dict, topology: dict, width: int) -> list[str]:
 
 
 def _slot_detail(row: dict, width: int) -> list[str]:
-    return ["", "SLOT DETAIL  (read only)",
-            _line(f"{_replica_prefix(row)}Slot {number(row.get('slot'))}   Group {number(row.get('group'))}   State {safe(row.get('state'), 16)}", width),
-            _line(f"Request {safe(row.get('request_id'), 24)}   Held {number(row.get('held_tokens'))} tokens", width),
-            _line(f"Prompt {number(row.get('prompt_tokens'))}   New read {number(row.get('prompt_read'))}   Output {number(row.get('generated'))}", width),
-            _line(f"Elapsed {number(row.get('elapsed_s'), ' s', 1)}   Slot rate {number(row.get('tok_s'), ' tok/s', 1)}", width),
-            "Group is a pipeline batch group, not a GPU assignment"]
+    lines = ["", "SLOT DETAIL  (read only)",
+             _line(f"{_replica_prefix(row)}Slot {number(row.get('slot'))}   Group {number(row.get('group'))}   State {safe(row.get('state'), 16)}", width),
+             _line(f"Request {safe(row.get('request_id'), 24)}   Held {number(row.get('held_tokens'))} tokens", width),
+             _line(f"Prompt {number(row.get('prompt_tokens'))}   New read {number(row.get('prompt_read'))}   Output {number(row.get('generated'))}", width),
+             _line(f"Elapsed {number(row.get('elapsed_s'), ' s', 1)}   Slot rate {number(row.get('tok_s'), ' tok/s', 1)}", width)]
+    if row.get("owner") is not None:
+        lines.append(_line(f"Conversation {safe(row.get('owner'), 32)}   "
+                           f"{'held' if row.get('owned') is True else 'window closed'}", width))
+    if row.get("zone") is not None:
+        lines.append(_line(f"Serves {safe(row.get('zone'), 16)} requests"
+                           "   (a named conversation is admitted only to a reserved slot)", width))
+    lines.append("Group is a pipeline batch group, not a GPU assignment")
+    return lines
+
+
+def _slot_protect(work: dict) -> str:
+    """One line about the slot routing: how long a slot belongs to its conversation, how many slots are held now,
+    how many of them only the conversations that name themselves may enter, and how many requests a full server
+    has refused.
+
+    Empty when the server runs with none of the three settings - the panel then reads exactly as it did.  Each part
+    is left out with its own setting off, so a server that splits the batch without a window says so and says no
+    more.  A held slot shows as idle with no token produced, which is the one state the slot rows cannot tell apart
+    from a free slot; this line and the `*` on the rows are what say so."""
+    parts = []
+    window = _protect_active(work)
+    if window:
+        holders = work.get("slot_holders")
+        holders = holders if type(holders) is int and holders >= 0 else None
+        parts.append(f"Slot protect {number(work.get('slot_protect_seconds'), 's', 0)}")
+        parts.append(f"Held {number(holders) if holders is not None else '--'}/{number(work.get('slots_effective'))}")
+    protected = work.get("protected_slots")
+    if type(protected) is int and protected > 0:
+        parts.append(f"Reserved {protected} for named conversations")
+    if work.get("reject_when_full") is True:
+        parts.append(f"Refused {number(work.get('slot_refusals'))}")
+    if not parts:
+        return ""
+    # the `*` is a slot row's marker, and only the window puts it there: a server that reserves slots without a
+    # window has no marked row to explain
+    return "   ".join(parts) + ("   * slot closed to other conversations" if window else "")
+
+
+def _protect_active(work: dict) -> bool:
+    """Is the server running with a slot window?  Nothing about owners is shown when it is not."""
+    window = work.get("slot_protect_seconds")
+    return (not isinstance(window, bool) and isinstance(window, (int, float)) and
+            math.isfinite(window) and window > 0)
+
+
+def _slots_routing(work: dict) -> bool:
+    """Is the server routing its batch slots at all - the window, a reserved part of the batch, or the refusal of a
+    full one?  Each of the three reports itself, so a server that runs one of them without the others is shown for
+    that one and for nothing else.  The `*` on a slot row is not: it marks a slot a window is open on."""
+    return (_protect_active(work)
+            or (type(work.get("protected_slots")) is int and work.get("protected_slots") > 0)
+            or work.get("reject_when_full") is True)
+
+
+def _slot_owner(row: dict) -> str:
+    """The conversation a slot belongs to, as the row's marker: `*` while the window is open on it."""
+    return "*" if row.get("owned") is True else " "
 
 
 def _row_window(rows: list[dict], selected: int, capacity: int) -> tuple[int, int, int]:
@@ -368,8 +424,9 @@ def _wide_serving(lines: list[str], snapshot: dict, width: int, height: int,
         left.append(no_requests_text(filter_text) if filter_text else "No matching request summaries")
     else:
         left.append("Request identity unavailable; showing engine slots")
+        owner_mark = _slot_owner if _protect_active(work) else (lambda row: "")
         for row in work.get("slots") or []:
-            left.append(_line(f"{_replica_short(row)}slot {number(row.get('slot')):<2} group {number(row.get('group')):<2} {field(row.get('state'), 10)} in {number(row.get('prompt_tokens')):<7} {_request_work(row)}", left_width))
+            left.append(_line(f"{owner_mark(row)}{_replica_short(row)}slot {number(row.get('slot')):<2} group {number(row.get('group')):<2} {field(row.get('state'), 10)} in {number(row.get('prompt_tokens')):<7} {_request_work(row)}", left_width))
     # Reserve space for group occupancy, mapping provenance and the footer at standard 30-row terminals.
     count = min(max(len(left), len(devices) + 1), max(1, height - len(lines) - 8))
     right = ["GPU SENSORS  (per card)"]
@@ -595,6 +652,9 @@ def render_view(snapshot: dict, view: str, width: int = 80, height: int = 24,
         if work.get("stage_in_flight") or work.get("replica_stage_samples"):
             lines.append(_stage_in_flight(work, width))
         lines.append(f"Pane: {serving_pane.title()}   Tab switches Devices / Requests / Groups")
+        protect = _slot_protect(work)
+        if protect:
+            lines.append(protect)
         if not detail and serving_pane == "requests":
             lines.insert(-1, f"First engine token {number(recent[0].get('first_engine_token_s') if recent else None, ' s', 3)} [last completed, since queue entry]")
         if not work.get("stage_in_flight") and not (detail and serving_pane == "requests"):
@@ -619,9 +679,10 @@ def render_view(snapshot: dict, view: str, width: int = 80, height: int = 24,
             start = min(max(0, selected - capacity // 2), max(0, len(rows) - capacity))
             scope = "replica / pipeline group" if str(topology.get("mode") or "").startswith("replicas") else "pipeline group"
             lines += [f"Slot / {scope} {start + 1 if rows else 0}-{min(start + capacity, len(rows))} of {len(rows)}  (occupancy is not rows/window)"]
+            owner_mark = _slot_owner if _protect_active(work) else (lambda row: "")
             for i, row in enumerate(rows[start:start + capacity], start):
                 cursor = ">" if i == selected else " "
-                lines.append(_line(f"{cursor}{_replica_short(row)}slot {number(row.get('slot')):<3} group {number(row.get('group')):<3} {field(row.get('state'), 11)} req {field(row.get('request_id'), 12)} in {number(row.get('prompt_tokens')):<7} {_request_work(row)} {number(row.get('tok_s'), ' tok/s', 1)}", width))
+                lines.append(_line(f"{cursor}{owner_mark(row)}{_replica_short(row)}slot {number(row.get('slot')):<3} group {number(row.get('group')):<3} {field(row.get('state'), 11)} req {field(row.get('request_id'), 12)} in {number(row.get('prompt_tokens')):<7} {_request_work(row)} {number(row.get('tok_s'), ' tok/s', 1)}", width))
             if not rows:
                 lines.append("Slot detail unavailable")
             elif detail:

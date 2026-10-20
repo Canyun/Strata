@@ -964,8 +964,20 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
-        self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
+                 slot_protect_seconds: float | str | None = None, protected_slots: list[int] | str | None = None,
+                 reject_when_full: bool | str | None = None):
+        # the 0 is _attempt: a restart starts its try count over, and the tuple is positional, so it sits here;
+        # the tail is this engine's routing settings, which restart() passes back positionally
+        self.spawn = (exe, list(args), cwd, log, env, False, cpus, 0, slot_protect_seconds,
+                      protected_slots, reject_when_full)
+        # a lazy engine is built before READY and restart() runs this whole path: the ownership tables exist from
+        # here, filled with their defaults, and are sized for real below (as slot_used is).  A missing attribute
+        # would raise inside a request, because pick_slot runs against an engine that is restarting.
+        self.slot_protect_seconds = slot_protect_seconds_of({"slot_protect_seconds": slot_protect_seconds})
+        self.slot_reject_full = reject_when_full_of({"reject_when_full": reject_when_full})
+        self.slot_owner: list = []
+        self.slot_zone: list = []
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -1087,7 +1099,10 @@ class StrataEngine:
                           f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
                           flush=True)
                 time.sleep(wait_s)
-                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1)
+                # self.spawn[8:] carries this engine's routing settings (the slot protect window): a retry that
+                # drops them starts an engine that routes nothing - a conversation silently loses the slot its
+                # chain lives in (restart() keeps them through self.spawn; a start-up retry must too)
+                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1, *self.spawn[8:])
                 return
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
                    "the engine exited before it was ready")
@@ -1143,6 +1158,13 @@ class StrataEngine:
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
+        # "slot_protect_seconds": which conversation each slot belongs to (its chain lives there).  Written at an
+        # admission and kept when the slot frees at BDONE: the slot stays that conversation's for the window, which
+        # is what brings its next turn back to the chain in it (see pick_slot).  An empty table with the window off.
+        self.slot_owner: list = [None] * self.batch
+        # "protected_slots": which kind of request each slot serves (the conversations that name themselves, and
+        # everything else).  An empty table with no partition: every slot serves every request, as it always has.
+        self.slot_zone: list = protected_slots_of(self.batch, {"protected_slots": protected_slots})
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
@@ -1757,6 +1779,10 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
+        # "strata_session": the conversation this request names itself as.  It is computed once: every pick_slot
+        # below - the reserved slot of a give-way, the #1994 refusal that picks a new slot - routes by the same
+        # id, so a conversation's turns stay in the one slot that holds its chain.
+        skey = session_of(sampling)
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1772,6 +1798,8 @@ class StrataEngine:
         stop_sent = False
         yields, solo_again, refused = 0, 0, 0
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
+        # the last heartbeat sent while queued for a slot (see QUEUE_BEAT_S below)
+        admit_beat = time.monotonic()
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -1805,7 +1833,7 @@ class StrataEngine:
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt)
+                                reserved = self.pick_slot(prompt, skey)
                                 if reserved is not None:
                                     self.slot_busy[reserved] = True
                                     self.slot_claims.add(reserved)
@@ -1856,7 +1884,7 @@ class StrataEngine:
                             if deadline is not None and time.monotonic() >= deadline:
                                 raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                slot = self.pick_slot(prompt, skey)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
@@ -1871,7 +1899,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, skey) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
@@ -1882,9 +1910,27 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, skey) is None:
+                                    if getattr(self, "slot_reject_full", False):
+                                        # "reject_when_full": the queue is what this path is, and the request is
+                                        # refused instead.  The HTTP layer asks the same pick before it writes any
+                                        # headers, so it answers 429 and this raise is the request that was admitted
+                                        # a moment earlier and lost the slot to a conversation's lock (the race the
+                                        # pre-check cannot close).  Both end the same way: the refusal's message.
+                                        raise SlotFull("every batch slot is taken or locked to its conversation")
                                     wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
                                     self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
+                            if slot is None and time.monotonic() - admit_beat >= QUEUE_BEAT_S:
+                                # a request queued for a slot holds no control lines, so it yields no heartbeat of its
+                                # own: _take_control has one and this path had none.  "slot_protect_seconds" makes
+                                # this path real: a conversation with more turns running than there are slots, and a
+                                # second request of a conversation whose own turn is decoding, both wait a whole turn
+                                # here - longer than the idle watchdog of an agent client.  The None is the heartbeat
+                                # the HTTP layer already turns into an SSE comment, and nothing is held while waiting,
+                                # so it cannot block anybody.  #1619's QUEUE_BEAT_S is the same keep-alive for the wait
+                                # on the single turn: same situation, same constant.
+                                admit_beat = time.monotonic()
+                                yield None
                             if cancel.is_set():
                                 return
                             if not holding:
@@ -1922,6 +1968,8 @@ class StrataEngine:
                     if started is not None:
                         started()
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
+                    # the slot is this conversation's from here (the owner is not cleared when it frees)
+                    self._note_owner(slot, skey)
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
@@ -2101,10 +2149,58 @@ class StrataEngine:
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def _slot_owned_live(self, slot: int, now: float) -> bool:
+        """A slot is owned while its conversation used it within the protect window.  Past the window it holds a
+        dead conversation and the next conversation takes it (the pick, and the panel's flag)."""
+        owners = getattr(self, "slot_owner", None)
+        grace = getattr(self, "slot_protect_seconds", 0.0)
+        return (grace > 0 and owners is not None and slot < len(owners) and owners[slot] is not None
+                and now - self.slot_used[slot] <= grace)
+
+    def _zones_active(self) -> bool:
+        """True when "protected_slots" routes requests: a partition is in place on this many slots, and this engine
+        run keeps conversation caches at all (a pipelined group of several slots keeps none, so no slot is
+        anybody's and a partition on it would only shrink the batch for nothing)."""
+        zones = getattr(self, "slot_zone", None)
+        return (bool(zones) and len(zones) == getattr(self, "batch", 0)
+                and getattr(self, "slot_gs", 0) <= 1)
+
+    def _zone_of(self, slot: int) -> str:
+        """Which kind of request slot `slot` serves: "protected" (the conversations that name themselves) or
+        "public" (everything else)."""
+        zones = getattr(self, "slot_zone", None)
+        return zones[slot] if zones and slot < len(zones) else "public"
+
+    def _note_owner(self, slot: int, session: str | None) -> None:
+        """The admission takes the slot for the conversation that named itself.  The owner is not cleared at BDONE:
+        the slot stays that conversation's for the window, which is what brings its next turn back to the chain in
+        it.  A request that names no conversation owns nothing: its slot is the one the plain pick gives it, as
+        before."""
+        owners = getattr(self, "slot_owner", None)
+        if owners is not None and getattr(self, "slot_protect_seconds", 0.0) and session:
+            owners[slot] = session
+
+    def pick_slot(self, prompt: list[int], session: str | None = None) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
-        conversations other slots hold stay for their next turns.  None: every slot is busy."""
+        conversations other slots hold stay for their next turns.  None: no slot can take this request.
+
+        `session` - the conversation the request names itself as ("strata_session") - is the only thing this routes
+        on beyond the tokens, and with "slot_protect_seconds" off and "protected_slots" off (the defaults) it changes
+        nothing at all: the pick below is the pick that has always been.  Both settings are vetoes, not preferences:
+
+        * the window locks a slot to the conversation that owns it.  Nothing else enters it while the window is open,
+          not a request that names a conversation and not one that names nothing - the plain pick reads only the
+          prompt's tokens and used to walk into an idle locked slot and overwrite the chain its owner will come back
+          to.  A second turn of a conversation whose own slot is decoding queues for that slot: a second copy of the
+          conversation elsewhere evicts whatever it lands on (turn after turn, both rebuilt from token 0).
+        * the partition routes by kind: a conversation that names itself is admitted only to a "protected" slot and
+          a request that names nothing only to a "public" one, so the traffic that has no chain to keep never
+          displaces a chain.  Neither kind crosses over: each side has its own slots and nothing else.
+
+        Neither rule is consulted on pipelined groups of several slots (slot_gs > 1): the engine keeps no idle slot
+        below a busy one as a cache there (its pad row writes it), so a chain cannot be held and no slot is
+        anybody's."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
@@ -2119,6 +2215,7 @@ class StrataEngine:
                 g0 = b - b % gs
                 return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
             return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
+
         def held_prefix(b):
             # what of `prompt` the slot's cache serves: the slot's whole held stream (the prompt and what it decoded)
             # when this prompt continues it, else its turn checkpoint - the engine takes one at the last <|im_start|> of
@@ -2133,6 +2230,43 @@ class StrataEngine:
                 return len(h)
             k = len(h) - 1 - h[::-1].index(self.TURN_ID) if self.TURN_ID in h else 0
             return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
+
+        owners = getattr(self, "slot_owner", None)
+        # the table has to be this engine's: __init__ sizes it where the slot tables are sized, so an engine that is
+        # restarting (its slot tables are the old engine's, its owner table not written yet) falls to the plain pick
+        # rather than indexing a table that is shorter than the slots
+        window = bool(getattr(self, "slot_protect_seconds", 0.0))
+        owned = owners is not None and len(owners) == self.batch
+        zones = self._zones_active()
+        if window or zones:
+            now = time.time()
+            want = slot_zone_of(session, zones)
+            if want:
+                # the partition is strict: a conversation is admitted only to a reserved slot and traffic that names
+                # nothing only to a public one.  Filling the other kind is what would empty it: the conversation's
+                # next turn is routed by its owner, so it stays there, and the slot the public traffic needs is gone
+                # for the window - one turn at a time, until the public side has no slots left
+                free = [b for b in free if self._zone_of(b) == want]
+                if not free:
+                    return None
+            if window and owned:
+                # its own slot, whenever it is free - the chain in it is worth more than any neighbour's prefix
+                mine = [b for b in free if owners[b] == session] if session else []
+                if mine:
+                    return min(mine, key=lambda b: (-held_prefix(b), self.slot_used[b]))
+                # its chain is in a slot that is busy (its own turn running, or a read that gave way): the request
+                # queues for that slot.  Taking another would put a second copy of the conversation in the engine,
+                # and evict whatever the second copy lands on
+                if session and any(self.slot_busy[b] and owners[b] == session for b in self.slot_order):
+                    return None
+                # the lock is absolute: no request enters a slot whose window is open - not a conversation of the
+                # other kind, and not the plain traffic that names no conversation at all (the pick below reads only
+                # the prompt's tokens, and it used to walk into an idle locked slot and overwrite the chain its
+                # owner will come back to).  What is left is slots nobody owns: never used, or their conversation
+                # idle past the window, so a new conversation never displaces a live chain
+                free = [b for b in free if not self._slot_owned_live(b, now)]
+                if not free:
+                    return None
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
@@ -2146,19 +2280,54 @@ class StrataEngine:
         return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
                                         bool(self.slot_held[b]), self.slot_used[b]))
 
+    def slot_rejection(self, session: str | None) -> tuple[str, float] | None:
+        """Read the admission once, without waiting, for a request from the conversation `session`: None when a slot
+        can take it now, else (why not, how many seconds until one is likely to).  "reject_when_full" answers 429
+        with it: the answer has to exist before the HTTP layer writes any headers, and this is the same pick the
+        admission runs, so the two can never disagree about what "full" means (an empty prompt is enough: no prefix
+        match can turn "no free slot" into "a free slot").
+
+        The seconds are the soonest thing that will free a slot - a lock's window closing, else the interval the
+        admission itself polls on - which is what a client's backoff wants, not a number to trust."""
+        if self.pick_slot([], session) is not None:
+            return None
+        window = float(getattr(self, "slot_protect_seconds", 0.0) or 0.0)
+        retry = SLOT_POLL_S
+        if window:
+            now = time.time()
+            opening = [window - (now - self.slot_used[b]) for b in range(self.batch)
+                       if self._slot_owned_live(b, now)]
+            if opening:
+                retry = max(SLOT_POLL_S, min(opening, default=retry))
+        return ("every batch slot is taken or locked to its conversation", round(retry, 1))
+
     def slots_view(self) -> list[dict]:
-        """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
+        """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding.
+        With the config's "slot_protect_seconds" each slot also names the conversation that owns it and whether the
+        window is still open on it: a slot that reads "idle, free" while it is closed to every conversation but its
+        owner is exactly the state to see (the fourth conversation that is not running has nothing else to show it).
+        With the config's "protected_slots" each slot names the kind of request it serves, because a slot an
+        unnamed request cannot enter looks free and is not.  With both off the view is exactly as it was."""
         now, view = time.time(), []
+        owners = getattr(self, "slot_owner", None)
+        grace = getattr(self, "slot_protect_seconds", 0.0)
+        zones = self._zones_active()
         for b in range(self.batch):
             r = self.slot_live[b]
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
-                continue
-            ft = r.get("first_token")
-            view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
-                         "prompt_read": r.get("prompt_read") if r["state"] == "reading" else None,
-                         "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
+                v: dict = {"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])}
+            else:
+                ft = r.get("first_token")
+                v = {"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
+                     "prompt_read": r.get("prompt_read") if r["state"] == "reading" else None,
+                     "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
+                     "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None}
+            if grace:
+                v["owner"] = owners[b] if owners and b < len(owners) else None
+                v["owned"] = self._slot_owned_live(b, now)
+            if zones:
+                v["zone"] = self._zone_of(b)
+            view.append(v)
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -3623,6 +3792,309 @@ class StopMatcher:
 
 
 
+SLOT_PROTECT_MAX_S = 86400.0
+# a day: a window past it owns every slot forever - no conversation goes idle past it, so the conversations
+# beyond the slots queue for good
+SLOT_POLL_S = 1.0
+# how often the admission re-reads the slot tables while it waits: the shortest answer a "full" refusal can
+# honestly point at (see slot_rejection)
+SLOT_OFF = ("", "0", "false", "no", "off", "none")     # the words that mean a slot routing setting is not set
+
+
+class SlotFull(RuntimeError):
+    """Every batch slot is taken or locked and "reject_when_full" is on: the request is refused with a 429 instead
+    of queueing.  Raised by the admission (a pick that keeps answering None), so the refusal means the same thing
+    at both ends; the HTTP layer asks the same pick first and answers 429 before it writes any headers."""
+
+
+def slot_zone_of(session: str | None, zones_active: bool) -> str:
+    """Which kind of batch slot a request belongs in: "protected" for the conversations that name themselves
+    ("strata_session": their chain lives in a slot and must not be displaced), "public" for everything else.  ""
+    when there is no partition: every slot serves every request, as it always has."""
+    if not zones_active:
+        return ""
+    return "protected" if session else "public"
+
+
+def protected_slots_of(batch: int, cfg: dict) -> list[str]:
+    """The config's top-level "protected_slots" (like "parallel"): how the batch slots are split between the
+    conversations that name themselves ("strata_session") and the traffic that names nothing.  A count is that many
+    slots from the start of the batch (2 on a batch of 4: slots 0 and 1 are protected, 2 and 3 are public); a list
+    names them ("[0,3]", "0,3", "0 3"), and an index outside the batch is dropped.  Absent, empty, off, or every
+    slot of the batch: no partition, the table is empty, and the pick routes by tokens and ownership as it always
+    has - a batch that is all protected would serve no request that names nothing at all, which is not a partition
+    but a server that answers nothing.  A value that is not slots at all warns and means no partition.
+
+    The answer is one entry per slot: "protected" or "public"."""
+    raw = (cfg or {}).get("protected_slots")
+    if raw is None or raw is True or raw is False or isinstance(raw, dict):
+        return []
+    batch = int(batch or 0)
+    if batch <= 0:
+        return []
+    if isinstance(raw, (list, tuple)) and len(raw) == batch and raw and \
+            all(x == "protected" or x == "public" for x in raw):
+        # a table this run resolved for itself (restart() hands its settings back positionally): keep it.  Reading
+        # it as a list of slot numbers would find no numbers in it and drop the split on the restart
+        return list(raw)
+    wanted: list[int] = []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.lower() in SLOT_OFF:
+            return []
+        try:
+            # a count ("2") and a list ("0,3" / "0 3") are both a list of numbers; a list of slots cannot name a
+            # slot twice, so the count is read as a count and never split into digits
+            wanted = [int(x) for x in text.replace(",", " ").split()]
+            if len(wanted) > 1 and sorted(set(wanted)) != sorted(wanted):
+                raise ValueError("a list of slots cannot repeat one")
+        except ValueError:
+            print(f'[strata] config "protected_slots"={raw!r}: expected a count of slots or a list of slot numbers: '
+                  "no partition", flush=True)
+            return []
+    elif isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            if isinstance(item, bool) or not isinstance(item, int):
+                continue
+            wanted.append(int(item))
+    elif isinstance(raw, int):
+        wanted = list(range(int(raw)))
+    else:
+        print(f'[strata] config "protected_slots"={raw!r}: expected a count of slots or a list of slot numbers: '
+              "no partition", flush=True)
+        return []
+    keep = {b for b in wanted if 0 <= b < batch}
+    if not keep or len(keep) >= batch:
+        return []
+    return ["protected" if b in keep else "public" for b in range(batch)]
+
+
+def reject_when_full_of(cfg: dict) -> bool:
+    """The config's top-level "reject_when_full" (like "parallel"): answer a request that finds no batch slot free
+    with 429 instead of queueing it.  Off (the default): the queue, exactly as it was - a client that cannot read a
+    429 keeps working.  On: a conversation whose slot is decoding, and a conversation beyond the last protected
+    slot, both get an answer with a Retry-After rather than a stream that says nothing for a whole turn."""
+    raw = (cfg or {}).get("reject_when_full")
+    if raw is None or raw is False:
+        return False
+    if raw is True:
+        return True
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in SLOT_OFF:
+            return False
+        return text in ("1", "true", "yes", "on")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return bool(raw)
+    print(f'[strata] config "reject_when_full"={raw!r}: expected true or false: the queue stays', flush=True)
+    return False
+
+
+def slot_protect_seconds_of(cfg: dict) -> float:
+    """The config's top-level "slot_protect_seconds" (like "parallel"): how long a batch slot belongs to the
+    conversation that last used it, during which no other conversation takes it.  A conversation's chain lives in
+    one slot; without ownership a neighbour's turn lands there, the engine drops what it held, and the
+    conversation reads its whole prompt again every turn.  Absent, 0, false: no ownership, every free slot serves
+    every request (the default, byte-identical to upstream).  Only a request that names its conversation
+    ("strata_session") is routed by this; a request that names nothing is picked as before.  A window above
+    SLOT_PROTECT_MAX_S is clamped with a warning: past the ceiling the slots stay owned and every other
+    conversation queues for a window that never passes."""
+    raw = (cfg or {}).get("slot_protect_seconds")
+    if raw is None or raw is True or raw is False:
+        return 0.0
+    if isinstance(raw, str):
+        if raw.strip().lower() in ("", "0", "false", "no", "off", "none"):
+            return 0.0
+        raw = raw.strip()
+    if not isinstance(raw, (int, float)):
+        try:
+            raw = float(raw)
+        except (TypeError, ValueError):
+            print(f'[strata] config "slot_protect_seconds"={raw!r}: expected a number of seconds: slot protect off',
+                  flush=True)
+            return 0.0
+    seconds = float(raw)
+    if seconds <= 0:
+        return 0.0
+    if seconds > SLOT_PROTECT_MAX_S:
+        print(f'[strata] config "slot_protect_seconds"={seconds:.0f} clamped to {SLOT_PROTECT_MAX_S:.0f}: a longer '
+              "window keeps the slots owned forever and every other conversation queues for good", flush=True)
+        return SLOT_PROTECT_MAX_S
+    return seconds
+
+
+def refusal_of(text) -> bool:
+    """The "answer a full server instead of queueing" switch, read from a flag's word: on (a bare flag) answers 429,
+    off keeps the queue.  One flag answers both ways, as the seconds and the split of the pair answer both ways with
+    0/off - a run that wants to cancel a value a profile saved says so on the same flag it would use to set it.  A
+    bare flag is on: nobody types a switch flag to ask for what the default already is.  The flag takes the two
+    words its help names, and not the looser words a config accepts: what is typed at a terminal is checked while it
+    can still be fixed.  ValueError for a word that is neither answer."""
+    if isinstance(text, bool):
+        return text
+    raw = str(text).strip().lower()
+    if raw == "off":
+        return False
+    if raw == "on":
+        return True
+    raise ValueError(f"{text!r}: expected on or off")
+
+
+def slot_routing_summary(engine) -> dict:
+    """The three slot routing settings of a running server, as one dict: "slot_protect_seconds" (the window),
+    "protected_slots" (how many of the slots are kept for conversations) and "reject_when_full".  Only the settings
+    that are set appear, so a reader can tell a switch that is off from a server built before the switch existed.
+    A setting a server answers by asking its engines (a replica server: any replica's window, all of their slots) is
+    asked here, so the panel, /metrics and Prometheus read one answer that cannot be one card's view of a
+    many-card server."""
+    out: dict = {}
+    window = getattr(engine, "slot_protect_seconds", 0.0)
+    window = window() if callable(window) else window
+    window = float(window or 0.0)
+    if window:
+        out["slot_protect_seconds"] = window
+    zones = sum(1 for zone in (getattr(engine, "slot_zone", None) or []) if zone == "protected")
+    if zones:
+        out["protected_slots"] = zones
+    refuse = getattr(engine, "slot_reject_full", False)
+    if refuse() if callable(refuse) else refuse:
+        out["reject_when_full"] = True
+    return out
+
+
+def slot_seconds_value(text) -> float:
+    """--slot-protect-seconds / a profile's slot_protect_seconds, read as a number of seconds: a window the slots can
+    be held for, or a word that means "not this run" (SLOT_OFF) as 0.  A value that is not seconds - not a number,
+    above what can be held, below zero - is ValueError, because a value typed at a terminal is worth checking while
+    it can still be fixed and nothing has been loaded.  A window above SLOT_PROTECT_MAX_S is clamped, as the config's
+    window is; the startup line reports what the server runs with, so a clamp is never a quiet change."""
+    if isinstance(text, str) and text.strip().lower() in SLOT_OFF:
+        return 0.0
+    try:
+        seconds = float(text)
+    except (TypeError, ValueError):
+        raise ValueError(f"{text!r}: expected a number of seconds, or off") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f"{text!r}: expected a finite number of seconds, or off")
+    return min(seconds, SLOT_PROTECT_MAX_S)
+
+
+def slot_split_problem(text, slots: int, what: str = "--protected-slots") -> str | None:
+    """Why `text` cannot split a batch of `slots` slots, or None when it can: a count of slots from the start of
+    the batch ("2" protects slots 0 and 1, as the config's 2 does) or a list of slot numbers ("0,2" / "0 2").  A
+    count that protects the whole batch, and a list that names a slot this run has none of, are refused: the first
+    leaves no slot for a request that names nothing, which is not a split but a server that serves nobody, and the
+    second routes nothing.  The answer names what was checked (`what`) so the same rule reads well for a flag a
+    terminal typed and for a value a profile stored.  An off word means "no split" and is answered with None: it
+    cancels a value a config or a profile saved for this run."""
+    raw = str(text).strip()
+    if raw.lower() in SLOT_OFF:
+        return None
+    try:
+        wanted = [int(x) for x in raw.replace(",", " ").split()]
+    except ValueError:
+        return (f'{what} {text!r}: expected a count of slots ("2") '
+                "or a list of slot numbers (\"0,2\")")
+    if not wanted:
+        return f"{what} {text!r}: expected a count of slots or a list of slot numbers"
+    if len(wanted) == 1:
+        wanted = list(range(wanted[0]))             # one number: a count, as the config's number is
+    elif sorted(set(wanted)) != sorted(wanted):
+        return f"{what} {text!r}: a list of slots cannot name one slot twice"
+    slots = int(slots or 0)
+    if slots <= 0:
+        return (f"{what} {text!r}: this run asks the engine for no batch slots, "
+                "so no slot can be kept for a conversation")
+    keep = {b for b in wanted if 0 <= b < slots}
+    if keep != set(wanted):
+        return (f"{what} {text!r}: this run asks the engine for {slots} slot{'s' * (slots != 1)} "
+                f"(0..{slots - 1}): name slots in that range")
+    if len(keep) >= slots:
+        return (f"{what} {text!r}: every slot of this batch of {slots} is protected, so no request that names "
+                "nothing has a slot it can take: protect some of them, not all")
+    return None
+
+
+def slot_split_flag(text: str, slots: int) -> str:
+    """--protected-slots, checked against the batch this run asks for; ValueError for what cannot split it (see
+    slot_split_problem).  The text is returned as given: the engine reads the settings from the config verbatim."""
+    problem = slot_split_problem(text, slots)
+    if problem:
+        raise ValueError(problem)
+    return str(text).strip()
+
+
+def engine_slots_of(cfg: dict) -> int:
+    """How many batch slots this run asks the engine for: the --batch/--slots the engine args carry (what the
+    engine is told outright), else the config's "parallel" as a flag set it, else one (a server that runs one
+    request at a time).  The split of the slots is checked against this: "protected_slots" names slots by number,
+    and a number outside the batch protects nothing."""
+    args = cfg.get("args") or []
+    for flag in ("--batch", "--slots"):
+        if flag in args and args.index(flag) + 1 < len(args):
+            try:
+                asked = int(args[args.index(flag) + 1])
+                if asked > 0:
+                    return asked
+            except (TypeError, ValueError):
+                pass
+    asked = cfg.get("parallel")
+    if type(asked) is int and asked > 0:
+        return asked
+    return 1
+
+
+def slot_routing_note(engine) -> str | None:
+    """The line the server prints about the slot routing it runs with, or None when it runs none of it (the plain
+    pick, the queue).  A conversation that is neither running nor queued has no way to see why its turn waits, and
+    an operator who set the switches on a server that answers 429 should read what the server understood, once, at
+    the start.  The words are the settings as the engine read them (a window clamped to the ceiling is reported
+    clamped), so what is printed is what routes."""
+    summary = slot_routing_summary(engine)
+    if not summary:
+        return None
+    parts: list[str] = []
+    window = summary.get("slot_protect_seconds")
+    if window:
+        parts.append(f"a slot stays its conversation's for {window:g} s")
+    zones = summary.get("protected_slots")
+    if zones:
+        parts.append(f"{zones} slot{'s' * (zones != 1)} kept for the requests that name a conversation")
+    if summary.get("reject_when_full"):
+        parts.append("a full server answers 429 with a Retry-After instead of queueing")
+    return "[strata] slot protect: " + "; ".join(parts) + " (a request that names no conversation routes as before)"
+
+
+def slot_run_flags(a, cfg: dict) -> dict:
+    """The slot routing settings this run was started with, read from the operator's own flags: what each flag says,
+    checked as a flag and not as a config value, and only for the flags actually given (a flag left out says nothing
+    and leaves the config's value in place, so a profile can save a window and a run can cancel it).  A flag is
+    checked this way because it was typed at a terminal: an error is worth raising while it can still be fixed, and
+    nothing has been loaded yet.  --protected-slots is checked against the batch this run asks the engine for.
+    ValueError for a value that cannot name a slot."""
+    out: dict = {}
+    cfg = cfg or {}
+    if getattr(a, "slot_protect_seconds", None) is not None:
+        out["slot_protect_seconds"] = slot_seconds_value(a.slot_protect_seconds)
+    if getattr(a, "protected_slots", None) is not None:
+        out["protected_slots"] = slot_split_flag(a.protected_slots, engine_slots_of(cfg))
+    if getattr(a, "reject_when_full", None) is not None:
+        out["reject_when_full"] = refusal_of(a.reject_when_full)
+    return out
+
+
+def session_of(sampling: dict | None) -> str | None:
+    """The conversation a request names itself as ("strata_session", beside "strata_checkpoint"): the id a
+    conversation keeps its slot by.  What the pick matches on has to be something the client keeps stable, and a
+    prompt's start is not - a system prompt edited mid-session, a timestamp injected, history trimmed - each of
+    those moves a conversation to another slot and costs it the whole prompt.  None: the request names no
+    conversation, and the pick routes it by its tokens as it always has."""
+    raw = (sampling or {}).get("strata_session")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
 # Windows names that open a device whatever their extension or folder (Microsoft, "Naming Files, Paths, and Namespaces")
 _WIN_DEVICES = {"con", "prn", "aux", "nul", "conin$", "conout$", *(f"com{i}" for i in "123456789\u00b9\u00b2\u00b3"),
                 *(f"lpt{i}" for i in "123456789\u00b9\u00b2\u00b3")}
@@ -3719,6 +4191,7 @@ class Service:
         self.queue_timeout_s: float | None = None
         self.admission_reserved = 0
         self.admission_rejected = 0
+        self.slot_refusals = 0      # "reject_when_full": requests answered 429 because no batch slot could take them
         self.queue_timeouts = 0
         self.client_disconnect_cancels = 0
         self.draining = False
@@ -3820,6 +4293,37 @@ class Service:
         with self.admission_changed:
             self.admission_reserved -= 1
             self.admission_changed.notify_all()
+
+    def refusals_on(self) -> bool:
+        """Does this server answer "full" instead of queueing?  "reject_when_full" is read per engine, so on several
+        replicas one engine's setting answers 429 for all of them (see ReplicaEngine.slot_reject_full)."""
+        flag = getattr(self.engine, "slot_reject_full", False)
+        return bool(flag()) if callable(flag) else bool(flag)
+
+    def slot_refusal(self, sampling: dict) -> tuple[str, float] | None:
+        """The batch slots read once, before any header is written, for the conversation the request names
+        ("strata_session"): None when a slot can take it, else (why not, seconds to retry it in).  This is the
+        429 of "reject_when_full": the answer has to exist before the answer starts, so the queue is read through
+        the same pick the admission runs.  Nothing is answered on a server that keeps the queue (the default), one
+        without batch slots, or one that is not loaded: those requests go on exactly as they did."""
+        if not self.refusals_on() or not int(getattr(self.engine, "batch", 0) or 0) or not self.loaded():
+            return None
+        answer = self.engine.slot_rejection(session_of(sampling))
+        if answer is None:
+            return None
+        with self.status_lock:
+            self.slot_refusals += 1
+        return answer
+
+    def note_slot_refusal(self) -> None:
+        """Count a 429 the engine answered itself.  "reject_when_full" refuses in two places: the pre-check before
+        the headers, which counts inside slot_refusal, and the engine, which reads the slots again when it admits
+        and can take the answer away from a request the pre-check passed (a conversation's lock arriving in
+        between).  Both are the same 429 to the client, so both belong in the number an operator watches to tell
+        whether the batch is too small; counting only the first reads "no refusals" on a server that refuses every
+        request through the race."""
+        with self.status_lock:
+            self.slot_refusals += 1
 
     def note_client_disconnect(self, cancel: threading.Event) -> None:
         """Cancel once; count only work that was still queued or active when the client left."""
@@ -4459,6 +4963,22 @@ class Service:
             live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
+            # "slot_protect_seconds": the window the slots' owner/owned flags render against, and how many slots are
+            # held.  The window makes the difference visible: a conversation with a turn running is in a slot, one
+            # whose turn ended and whose slot is closed to the others is not (it holds a slot, it is not using one).
+            # Without this the screen shows idle slots and a conversation that has produced no token, and nothing
+            # tells the two situations apart.  The count is taken from the view, so a replicas server counts the slots
+            # it shows (the view of every replica), not one engine's table.
+            window = float(getattr(self.engine, "slot_protect_seconds", 0.0) or 0.0)
+            if window:
+                live["slot_holders"] = sum(1 for x in slots if x.get("owned"))
+            # "protected_slots" / "reject_when_full": how many slots only the conversations that name themselves
+            # may enter, whether full is answered with a refusal, and how many requests it has answered.  A
+            # conversation that is not running and not queued has nothing else to show it: the slots it cannot enter
+            # read idle.  One summary for the three settings, so the panel and /metrics cannot drift from each other.
+            live.update(slot_routing_summary(self.engine))
+            if self.refusals_on():
+                live["slot_refusals"] = self.slot_refusals
             if running and state == "idle":
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
@@ -6564,6 +7084,19 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    # "reject_when_full": the batch slots are read before anything is written, so a request that
+                    # finds no slot gets a 429 with a Retry-After rather than a stream that says nothing while a
+                    # conversation's turn decodes.  A server that keeps the queue (the default) answers nothing here.
+                    refusal = svc.slot_refusal(req)
+                    if refusal is not None:
+                        why, retry = refusal
+                        code = "slots_full"
+                        print(f"[strata] 429 {code}: {why} (retry in {retry}s)", flush=True)
+                        self._json(429, responses_error_body(why, "server_error", code=code) if path == "/v1/responses"
+                                   else {"error": {"type": "rate_limit_error", "code": code, "message": why}},
+                                   retry_after=max(1, round(retry)))
+                        return
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -6640,6 +7173,18 @@ def make_handler(svc: Service):
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except ModelBusy as e:
                 self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
+            except SlotFull as e:
+                # "reject_when_full": this request was admitted, then lost its slot to a conversation's lock (the
+                # race the pre-check before the headers cannot close).  Same answer, same code, so a client sees one
+                # reason for a 429 and backs off the same way, and the same count, so the panel's "Refused" is every
+                # refusal of this server and not only the ones the pre-check caught.
+                code = "slots_full"
+                svc.note_slot_refusal()
+                self._note(error={"type": "rate_limit_error", "code": code, "message": str(e)})
+                self._json(429, responses_error_body(str(e), "server_error", code=code)
+                           if path == "/v1/responses"
+                           else {"error": {"type": "rate_limit_error", "code": code, "message": str(e)}},
+                           retry_after=1)
             except QueueWaitExpired as e:
                 error = {"type": "rate_limit_error", "code": "queue_wait_timeout", "message": str(e)}
                 self._note(error=error)
@@ -6979,6 +7524,13 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "rate_limit_error", "code": "queue_wait_timeout", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except SlotFull as e:
+                # "reject_when_full": it lost its slot mid-queue.  The client reads it as an error inside the stream
+                # it already has, and the server counts it with the same refusals as a 429: one reason, one number.
+                svc.note_slot_refusal()
+                err = {"error": {"type": "rate_limit_error", "code": "slots_full", "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
                 err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
                 self._note(error=err["error"])
@@ -7087,6 +7639,11 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except QueueWaitExpired as e:
                 self._responses_failed(asm, str(e), "queue_wait_timeout", send)
+            except SlotFull as e:
+                # "reject_when_full": it lost its slot mid-queue, and the answer is the same refusal the pre-check
+                # gives, in the stream's own shape, counted in the same number
+                svc.note_slot_refusal()
+                self._responses_failed(asm, str(e), "slots_full", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -7211,6 +7768,14 @@ def make_handler(svc: Service):
             except QueueWaitExpired as e:
                 err = {"type": "error", "error": {"type": "rate_limit_error", "code": "queue_wait_timeout",
                                                    "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except SlotFull as e:
+                # "reject_when_full": it lost its slot mid-queue, and this stream's own error event carries the same
+                # refusal, counted in the same number as the 429
+                svc.note_slot_refusal()
+                err = {"type": "error", "error": {"type": "rate_limit_error", "code": "slots_full",
+                                                  "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -7766,7 +8331,10 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         rc = rp.replica_cfg(cfg, i, groups[i])
         try:
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                      env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None)
+                                      env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None,
+                                      slot_protect_seconds=rc.get("slot_protect_seconds"),
+                                      protected_slots=rc.get("protected_slots"),
+                                      reject_when_full=rc.get("reject_when_full"))
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
@@ -7945,6 +8513,17 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     help="request this many simultaneous engine slots without changing the saved config")
     ap.add_argument("--batch-groups", default=None,
                     help="pipeline groups: auto or a positive integer, without changing the saved config")
+    ap.add_argument("--slot-protect-seconds", default=None, metavar="SECONDS",
+                    help="how long a batch slot stays the conversation that last used it, closed to the others "
+                         "(also \"slot_protect_seconds\" in the config; 0/off for the plain pick)")
+    ap.add_argument("--protected-slots", default=None, metavar="N",
+                    help="how many slots of the batch only a request that names its conversation (\"strata_session\") "
+                         "may enter, counted from the start, or a list of slot numbers (also \"protected_slots\" in "
+                         "the config; 0/off for no split)")
+    ap.add_argument("--reject-when-full", nargs="?", const="on", default=None, metavar="on|off",
+                    help="answer 429 with a Retry-After to a request that finds no batch slot, instead of queueing "
+                         "it for a whole turn (also \"reject_when_full\" in the config; the queue by default).  "
+                         "off cancels a value the config saved for this run")
     ap.add_argument("--max-queue", type=int, default=None,
                     help="maximum inference calls waiting beyond effective engine slots; 0 refuses overload")
     ap.add_argument("--queue-timeout", type=float, default=None,
@@ -8063,6 +8642,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if "--batch-groups" in cfg["args"]:
             ap.error("--batch-groups conflicts with the saved engine args")
         cfg["args"] = [*cfg["args"], "--batch-groups", a.batch_groups]
+    # the slot routing settings of this run: a flag the operator typed is checked as a flag (an error while it can
+    # still be fixed), and it overrides what the config saved, which is read per engine with a warning as ever
+    try:
+        cfg.update(slot_run_flags(a, cfg))
+    except ValueError as e:
+        ap.error(str(e))
     lift_reasoning_effort_arg(cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas
@@ -8192,7 +8777,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
         else:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                                  env=env, lazy=lazy)
+                                  env=env, lazy=lazy, slot_protect_seconds=cfg.get("slot_protect_seconds"),
+                                  protected_slots=cfg.get("protected_slots"),
+                                  reject_when_full=cfg.get("reject_when_full"))
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
@@ -8207,6 +8794,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
+    routing = slot_routing_note(engine)
+    if routing:                                       # the operator set the switches; say what the server understood
+        print(routing, flush=True)
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,

@@ -20,13 +20,14 @@ export const KNOWN_KEYS = new Set([
   'before_load_strict', 'before_load_timeout_s', 'cors_origins', 'trusted_origins', 'allowed_hosts', 'open_browser', 'prevent_sleep',
   'max_queue', 'queue_timeout', 'max_tokens', 'min_tokens', 'answer_room', 'threads', 'replicas', 'replica_cpus', 'replica_load_tokens',
   'elastic', 'elastic_idle_s', 'elastic_mib', 'min_free_vram_mib', 'vram_segment_mib', 'slot_save_path', 'telemetry_read_key', 'batch_telemetry',
+  'slot_protect_seconds', 'protected_slots', 'reject_when_full',
   'reasoning_effort', 'reasoning_close_retry', 'reasoning_loop_recovery', 'repeat_stop_tokens', 'tool_call_recovery', 'codex_compaction_cache',
   'codex_thread_titles', 'expert_profile_save', 'expert_profile_save_every', 'images', 'vision', 'mmproj', 'draft_vocab', 'ui_resource_profile',
   'ui_vision_enabled', 'component', 'native', 'uma', 'remote_expert_opt', 'diffusion_model', 'llm', 'vae', 'quant', 'type', 'url', 'timeout_s',
 ]);
 
-const BOOLS = new Set(['open_browser', 'prevent_sleep', 'elastic', 'env_to_user', 'gpus_asked', 'batch_telemetry', 'tool_call_recovery', 'reasoning_loop_recovery']);
-const NUMBERS = { port: [1, 65535], max_queue: [0, 1e6], queue_timeout: [0, 1e6], threads: [1, 4096], elastic_idle_s: [0, 1e7], min_free_vram_mib: [0, 1e7] };
+const BOOLS = new Set(['open_browser', 'prevent_sleep', 'elastic', 'env_to_user', 'gpus_asked', 'batch_telemetry', 'tool_call_recovery', 'reasoning_loop_recovery', 'reject_when_full']);
+const NUMBERS = { port: [1, 65535], max_queue: [0, 1e6], queue_timeout: [0, 1e6], threads: [1, 4096], elastic_idle_s: [0, 1e7], min_free_vram_mib: [0, 1e7], slot_protect_seconds: [0, 86400] };
 const REASONING = ['none', 'low', 'medium', 'high'];
 const SAMPLING = { temperature: [0, 10], top_p: [0, 1], top_k: [1, 64], min_p: [0, 1], presence_penalty: [-10, 10], repetition_penalty: [0, 10], repeat_penalty: [0, 10], frequency_penalty: [-10, 10], penalty_last_n: [0, 1048576], repeat_last_n: [0, 1048576], seed: [0, 4294967295] };
 const WHOLE = new Set(['top_k', 'penalty_last_n', 'repeat_last_n', 'seed']);
@@ -124,6 +125,12 @@ export function checkRunConfig(text, { known = KNOWN_KEYS } = {}) {
     } else if (key in NUMBERS) {
       const [lo, hi] = NUMBERS[key];
       if (typeof value !== 'number' || !Number.isFinite(value) || value < lo || value > hi) add('error', 'number-range', key, { key, min: lo, max: hi, value: show(value) }, `"${key}" must be a number from ${lo} to ${hi}, not ${show(value)}.`);
+    } else if (key === 'protected_slots') {
+      // a count of batch slots ("2") or a list of their numbers ("0,2"), as serve reads it; which slots exist is
+      // the batch's business, so the check here is only that the value names slots at all
+      const slots = typeof value === 'string' ? value.replace(/,/g, ' ').trim().split(/\s+/) : Array.isArray(value) ? value : null;
+      const ok = slots !== null && slots.length > 0 && slots.every(n => (typeof n === 'number' ? Number.isInteger(n) && n >= 0 : /^\d+$/.test(n)));
+      if (!ok) add('error', 'text', key, { key }, `"${key}" must be a count of batch slots such as 2, or text naming their numbers such as "0,2".`);
     } else if (key === 'reasoning_effort') {
       if (!REASONING.includes(value)) add('error', 'choice', key, { key, choices: REASONING.join(', '), value: show(value) }, `"reasoning_effort" must be one of ${REASONING.join(', ')}, not ${show(value)}.`);
     } else if (key === 'gpu') {

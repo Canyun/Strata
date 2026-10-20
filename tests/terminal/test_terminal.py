@@ -385,6 +385,126 @@ class ContractTests(unittest.TestCase):
         self.assertIn("Rejected 3", display)
         self.assertIn("Disconnect cancels 2", display)
 
+    def test_slot_owner_transport_reaches_the_monitor_and_stays_bounded(self):
+        metrics = {"live": {"slot_protect_seconds": 120, "slot_holders": 2,
+                            "slots": [{"slot": i, "state": "idle", "held_tokens": 400,
+                                       "owner": f"conv-{i}", "owned": i < 2} for i in range(4)]}}
+        status = {"concurrency": {"serving": 4}, "model": "test-model", "started": 1}
+        clean = sanitize_telemetry(normalize_legacy(metrics, status))
+        self.assertEqual(clean["work"]["slot_protect_seconds"], 120)
+        self.assertEqual(clean["work"]["slot_holders"], 2)
+        self.assertEqual(clean["work"]["slots"][0]["owner"], "conv-0")
+        self.assertTrue(clean["work"]["slots"][0]["owned"])
+        self.assertFalse(clean["work"]["slots"][2]["owned"])
+        # the id is client-supplied: control characters and length are bounded, nothing else becomes an owner
+        dirty = sanitize_telemetry({"schema_version": 1, "work": {"slots_effective": 1, "slot_protect_seconds": 90,
+                                                                 "slots": [{"slot": 0, "state": "idle",
+                                                                            "owner": "\x1b[2J" + "x" * 400,
+                                                                            "owned": "yes"}]}})
+        self.assertEqual(dirty["work"]["slots"][0]["owner"], " [2J" + "x" * 116)
+        self.assertFalse(dirty["work"]["slots"][0]["owned"])
+        without = sanitize_telemetry(normalize_legacy({"live": {"slots": [
+            {"slot": i, "state": "idle"} for i in range(4)]}}, {"concurrency": {"serving": 4}}))
+        self.assertIsNone(without["work"]["slot_protect_seconds"])
+        self.assertIsNone(without["work"]["slots"][0]["owner"])
+        self.assertFalse(without["work"]["slots"][0]["owned"])
+
+    def test_monitor_shows_held_slots_only_with_the_window(self):
+        s = four_gpu_snapshot()
+        s["work"]["slot_protect_seconds"] = 120
+        s["work"]["slot_holders"] = 2
+        for i, row in enumerate(s["work"]["slots"]):
+            row["owner"], row["owned"] = f"conv-{i}", i < 2
+        s = sanitize_telemetry(s)
+        groups = render_view(s, "serving", 100, 30, serving_pane="groups")
+        self.assertIn("Slot protect 120s", groups)
+        self.assertIn("Held 2/8", groups)
+        self.assertIn(">*slot 0", groups)
+        self.assertIn(" slot 2", groups)
+        detail = render_view(s, "serving", 100, 30, serving_pane="groups", selected=0, detail=True)
+        self.assertIn("Conversation conv-0", detail)
+        self.assertIn("held", detail)
+        plain = render_view(sanitize_telemetry(four_gpu_snapshot()), "serving", 100, 30, serving_pane="groups")
+        self.assertNotIn("Slot protect", plain)
+        self.assertNotIn("Conversation", plain)
+        self.assertNotIn("*slot", plain)
+        self.assertIn("slot 0", plain)
+
+    def test_the_panel_shows_the_split_and_the_refusals_without_a_window(self):
+        """A server that reserves slots and refuses a full one, with the window off, has to say so: a slot its
+        conversations cannot enter reads idle and the refusals are invisible, which is the whole gap the line is for."""
+        s = four_gpu_snapshot()
+        s["work"]["protected_slots"] = 2
+        s["work"]["reject_when_full"] = True
+        s["work"]["slot_refusals"] = 3
+        for i, row in enumerate(s["work"]["slots"]):
+            row["zone"] = "protected" if i < 2 else "public"
+        shown = render_view(sanitize_telemetry(s), "serving", 110, 30, serving_pane="groups")
+        self.assertIn("Reserved 2 for named conversations", shown)
+        self.assertIn("Refused 3", shown)
+        self.assertNotIn("Slot protect", shown)          # no window: no window's numbers, no `*` legend
+        self.assertNotIn("* slot closed", shown)
+        bare = render_view(sanitize_telemetry(four_gpu_snapshot()), "serving", 110, 30, serving_pane="groups")
+        self.assertNotIn("Reserved", bare)
+        self.assertNotIn("Refused 3", bare)
+
+    def test_wide_pages_show_the_window_and_the_detail_panels_stay_untouched(self):
+        try:
+            from rich.console import Console
+
+            from strata_cli.dashboard import MonitorHistory, render_dashboard
+            from strata_cli.detail_dashboard import render_detail_dashboard
+        except ImportError:
+            self.skipTest("optional Rich dependency absent")
+
+        def draw(sample, width, height):
+            output = io.StringIO()
+            history = MonitorHistory()
+            history.add(sample, ("id", "test"))
+            Console(file=output, width=width - 2, color_system=None).print(
+                render_detail_dashboard(sample, "serving", width=width - 2, height=height - 2,
+                                        history=history, color=False, serving_pane="groups"))
+            return output.getvalue()
+
+        s = four_gpu_snapshot()
+        s["sampled_at"] = time.time()
+        s["work"]["slot_protect_seconds"] = 90
+        s["work"]["slot_holders"] = 1
+        for i, row in enumerate(s["work"]["slots"]):
+            row["owner"], row["owned"] = f"conv-{i}", i == 0
+        s = sanitize_telemetry(s)
+        plain = sanitize_telemetry(four_gpu_snapshot())
+        plain["sampled_at"] = time.time()
+        # a slot row is the one line the pane is for; the window line must not displace any of them
+        rows = lambda rendered: sum(1 for line in rendered.splitlines() if "/--" in line)
+        for width, height in ((140, 44), (128, 36)):
+            shown, bare = draw(s, width, height), draw(plain, width, height)
+            self.assertIn("Slot protect 90s", shown)
+            self.assertIn("*S0", shown)
+            self.assertTrue(all(len(line) <= width - 2 for line in shown.splitlines()))
+            self.assertEqual(len(shown.splitlines()), len(bare.splitlines()))
+            self.assertGreaterEqual(rows(shown), 5)
+            self.assertEqual(rows(shown), rows(bare))
+        # a short panel has no rows to spare: the window line stays out and the slot rows keep their room
+        for width, height in ((80, 24), (60, 16)):
+            shown = draw(s, width, height)
+            self.assertNotIn("Slot protect 90s", shown)
+            self.assertEqual(len(shown.splitlines()), len(draw(plain, width, height).splitlines()))
+        narrow = draw(s, 80, 24)
+        self.assertTrue(all(len(line) <= 78 for line in narrow.splitlines()))
+        output = io.StringIO()
+        Console(file=output, width=110, color_system=None).print(
+            render_dashboard(s, width=110, height=30, history=MonitorHistory(), color=False))
+        self.assertIn("Protect 90s  held 1/8", output.getvalue())
+        output = io.StringIO()
+        Console(file=output, width=80, color_system=None).print(
+            render_dashboard(s, width=80, height=24, history=MonitorHistory(), color=False))
+        self.assertIn("Protect 90s  held 1/8", output.getvalue())
+        output = io.StringIO()
+        Console(file=output, width=110, color_system=None).print(
+            render_dashboard(plain, width=110, height=30, history=MonitorHistory(), color=False))
+        self.assertNotIn("Protect 90s", output.getvalue())
+
     def test_wide_parallel_layout_keeps_no_slot_requests_visible(self):
         s = four_gpu_snapshot()
         s["work"]["requests"] = [

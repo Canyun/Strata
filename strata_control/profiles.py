@@ -24,7 +24,7 @@ from pathlib import Path
 
 PROFILE_ID = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 OVERRIDE_KEYS = frozenset({"host", "port", "parallel", "batch_groups", "max_queue", "queue_timeout", "offline",
-                           "batch_telemetry"})
+                           "batch_telemetry", "slot_protect_seconds", "protected_slots", "reject_when_full"})
 
 
 class ProfileError(ValueError):
@@ -77,6 +77,17 @@ def parse_assignment(text: str) -> tuple[str, object]:
             value = float(raw)
         except ValueError:
             raise ProfileError("queue_timeout must be a number of seconds") from None
+    elif key == "slot_protect_seconds":
+        try:
+            value = float(raw)
+        except ValueError:
+            raise ProfileError("slot_protect_seconds must be a number of seconds") from None
+    elif key == "protected_slots":
+        # a count ("2") and a list of slot numbers ("0,2" / "0 2"); the words that mean "off" elsewhere are not
+        # used here, because 0 says it in the same form the value is set in
+        if not raw.strip() or not all(x.isdigit() for x in raw.replace(",", " ").split()):
+            raise ProfileError("protected_slots must be a count of slots or a list of slot numbers")
+        value = raw.strip()
     elif key == "batch_groups":
         if raw == "auto":
             value = raw
@@ -85,7 +96,7 @@ def parse_assignment(text: str) -> tuple[str, object]:
                 value = int(raw)
             except ValueError:
                 raise ProfileError("batch_groups must be auto or a positive whole number") from None
-    elif key in ("offline", "batch_telemetry"):
+    elif key in ("offline", "batch_telemetry", "reject_when_full"):
         if raw not in ("true", "false"):
             raise ProfileError(f"{key} must be true or false")
         value = raw == "true"
@@ -110,6 +121,14 @@ def validate_overrides(overrides: object) -> dict:
         if key == "queue_timeout" and (type(value) not in (int, float) or not math.isfinite(value)
                                         or not 0.1 <= value <= 600):
             raise ProfileError("queue_timeout must be finite seconds in 0.1..600")
+        if key == "slot_protect_seconds" and (type(value) not in (int, float) or not math.isfinite(value)
+                                              or value < 0):
+            # the ceiling is the server's (it clamps a longer window and says so): a profile stores seconds, and a
+            # window the slots cannot be held for is not seconds at all
+            raise ProfileError("slot_protect_seconds must be a finite number of seconds")
+        if key == "protected_slots" and (not isinstance(value, str)
+                                          or not all(x.isdigit() for x in value.replace(",", " ").split())):
+            raise ProfileError("protected_slots must be a count of slots or a list of slot numbers")
         if key == "batch_groups" and value != "auto" and (type(value) is not int or not 1 <= value <= 1024):
             raise ProfileError("batch_groups must be auto or in 1..1024")
         if key in ("offline", "batch_telemetry") and type(value) is not bool:

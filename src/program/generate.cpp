@@ -206,6 +206,21 @@ bool ckpt_pool_env() {
     }();
     return on;
 }
+// STRATA_SLOT_IMG_REUSE=1 (read once; off by default): a batch slot that ends on a conversation WITH pictures keeps its
+// state as a cache, and the next turn of that conversation continues from it.  Off, a conversation with pictures never
+// caches its slot (the slot records only WHETHER it had pictures, so its match cannot be checked) and every turn reads
+// its history from token 0.  The slot saves the pictures it holds as (start, hash) keys, the same identity the
+// conversation cache and the checkpoints use: the match is the request's pictures below the slot's length, key for key,
+// so a picture whose embeddings changed - a different encoder start, a CPU encoder that is not bit-reproducible (#2228) -
+// fails the match and the prompt is read as before.  The reuse therefore fails to the slow path, never to the wrong
+// conversation.
+bool slot_img_reuse_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SLOT_IMG_REUSE");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
 // STRATA_CKPT_THREADS=1 (read once; off by default): a layer split's checkpoint saves every stage's part at once, the
 // first on the calling thread and each later stage's on a thread of its own device (kept for the process: the copies'
 // private streams are per thread), instead of one stage after the other.  Each part is the same copy of the same state
@@ -11174,7 +11189,11 @@ int main(int argc, char** argv) {
             std::vector<int32_t> ids;
             bool cached = false;           ///< idle, and its sessions still hold `ids`
             bool cvec = true;              ///< the control vector setting `ids` were read with
-            bool img = false;              ///< the conversation has pictures (never reused from the slot)
+            bool img = false;              ///< the conversation has pictures (reused from the slot only under STRATA_SLOT_IMG_REUSE)
+            // the pictures `ids` holds, as (start, hash) keys: the pictures of the request that ended in this slot,
+            // cut at the length `ids` had then.  The slot's match compares the request's pictures below `ids.size()`
+            // against these (STRATA_SLOT_IMG_REUSE; empty while the switch is off, which is what `img` alone meant).
+            std::vector<ImgKey> imgs;
             // the checkpoint its prompt read took at the last turn boundary (the history before the new turn's
             // header): a client's next turn renders the history again WITHOUT this reply's thinking, so it matches
             // the slot's tokens only up to there - the slot's K/V up to it plus this state continue from it
@@ -11494,7 +11513,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
-                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        sl.cached = o.prompt_cache > 0 && (!sl.img || slot_img_reuse_env()) && !sl.tainted;
                         break;
                     }
                     sl.x = y;
@@ -11680,7 +11699,7 @@ int main(int argc, char** argv) {
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
                         // row writes this slot clears the flag (below, where the group starts), so a stale state is never reused
-                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        sl.cached = o.prompt_cache > 0 && (!sl.img || slot_img_reuse_env()) && !sl.tainted;
                     } else {
                         sl.x = y;
                         sl.p += 1;
@@ -12470,7 +12489,7 @@ int main(int argc, char** argv) {
             ConvCheckpoint::PromptPlan resume_plan;
             int64_t resume_plan_at = -1, resume_plan_end = -1;   // where it goes on, and the segment end it needs
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-            if (o.prompt_cache > 0 && req_imgs.empty())
+            if (o.prompt_cache > 0 && (req_imgs.empty() || slot_img_reuse_env()))
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     const bool idle_source = !sl.active && sl.cached;
@@ -12479,7 +12498,9 @@ int main(int argc, char** argv) {
                     const bool active_source = sl.active && !sl.tainted && slot_ckpt_move_env() &&
                                                (!use_mtp || batch_mtp || admit_slot >= 0);
                     if (sl.cvec != want_cvec || !(idle_source || active_source)) continue;
-                    if (idle_source && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
+                    // `sl.imgs` is empty when the slot holds no pictures, which is what this match always compared;
+                    // with pictures it is their (start, hash) identity (STRATA_SLOT_IMG_REUSE).
+                    if (idle_source && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, sl.imgs)) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
                         slot_ck = nullptr;
@@ -15260,7 +15281,9 @@ int main(int argc, char** argv) {
                         sl.draft_ready = true;
                     }
                     sl.cvec = cvec_cached;
-                    sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
+                    sl.img = !live_imgs.empty();   // pictures: matched by their (start, hash) keys, and only under STRATA_SLOT_IMG_REUSE
+                    if (slot_img_reuse_env())
+                        sl.imgs = live_imgs;       // the pictures of `sl.ids`' prompt part (the windows' tokens add none)
                     const ConvCheckpoint* best = nullptr;
                     size_t best_at = 0;   // its place in `checks` (STRATA_SLOT_CKPT_MOVE)
                     for (size_t i = 0; i < checks.size(); ++i) {

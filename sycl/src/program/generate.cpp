@@ -1408,6 +1408,21 @@ private:
 using ImgKey = strata::core::ConversationImageKey;
 using ConvCheckpoint = strata::core::ConversationCheckpoint;
 
+// STRATA_SLOT_IMG_REUSE=1 (read once; off by default): a batch slot that ends on a conversation WITH pictures keeps its
+// state as a cache, and the next turn of that conversation continues from it.  Off, a conversation with pictures never
+// caches its slot (the slot records only WHETHER it had pictures, so its match cannot be checked) and every turn reads
+// its history from token 0.  The slot saves the pictures it holds as (start, hash) keys, the same identity the
+// conversation cache and the checkpoints use: the match is the request's pictures below the slot's length, key for key,
+// so a picture whose embeddings changed fails the match and the prompt is read as before.  The reuse fails to the slow
+// path, never to the wrong conversation.
+bool slot_img_reuse_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SLOT_IMG_REUSE");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
+
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
     const uint8_t* p = (const uint8_t*) data;
     for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
@@ -8951,7 +8966,11 @@ int main(int argc, char **argv) try {
             std::vector<int32_t> ids;
             bool cached = false;           ///< idle, and its sessions still hold `ids`
             bool cvec = true;              ///< the control vector setting `ids` were read with
-            bool img = false;              ///< the conversation has pictures (never reused from the slot)
+            bool img = false;              ///< the conversation has pictures (reused from the slot only under STRATA_SLOT_IMG_REUSE)
+            // the pictures `ids` holds, as (start, hash) keys: the pictures of the request that ended in this slot,
+            // cut at the length `ids` had then.  The slot's match compares the request's pictures below `ids.size()`
+            // against these (STRATA_SLOT_IMG_REUSE; empty while the switch is off, which is what `img` alone meant).
+            std::vector<ImgKey> imgs;
             // the checkpoint its prompt read took at the last turn boundary (the history before the new turn's
             // header): a client's next turn renders the history again WITHOUT this reply's thinking, so it matches
             // the slot's tokens only up to there - the slot's K/V up to it plus this state continue from it
@@ -9192,7 +9211,7 @@ int main(int argc, char **argv) try {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
-                        sl.cached = o.prompt_cache > 0 && !sl.img;
+                        sl.cached = o.prompt_cache > 0 && (!sl.img || slot_img_reuse_env());
                         break;
                     }
                     sl.x = y;
@@ -9909,11 +9928,13 @@ int main(int argc, char **argv) try {
             int64_t slot_tokens = 0;
             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-            if (o.prompt_cache > 0 && req_imgs.empty())
+            if (o.prompt_cache > 0 && (req_imgs.empty() || slot_img_reuse_env()))
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
-                    if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
+                    // `sl.imgs` is empty when the slot holds no pictures, which is what this match always compared;
+                    // with pictures it is their (start, hash) identity (STRATA_SLOT_IMG_REUSE).
+                    if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, sl.imgs)) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
                         slot_ck = nullptr;
@@ -11839,7 +11860,9 @@ int main(int argc, char **argv) try {
                         sl.draft_ready = true;
                     }
                     sl.cvec = cvec_cached;
-                    sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
+                    sl.img = !live_imgs.empty();   // pictures: matched by their (start, hash) keys, and only under STRATA_SLOT_IMG_REUSE
+                    if (slot_img_reuse_env())
+                        sl.imgs = live_imgs;       // the pictures of `sl.ids`' prompt part (the windows' tokens add none)
                     const ConvCheckpoint* best = nullptr;
                     for (const ConvCheckpoint& c : checks)
                         if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&

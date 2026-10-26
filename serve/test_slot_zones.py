@@ -214,7 +214,61 @@ class TheLockIsAbsolute(unittest.TestCase):
         self.assertEqual(e.pick_slot([1, 2, 3], "conv-b"), 0)
 
 
-# ---- the answer when no slot can take the request ----------------------------------------------------------------
+# ---- the ledger: an admission always rewrites who owns the slot it took ------------------------------------------------
+
+class TheLedgerIsTheTruth(unittest.TestCase):
+    """The invariant every routing rule reads: after an admission takes a slot, slot_owner[slot] names the request
+    that took it - or nobody.  A stale name on a busy slot made the pick answer None to a conversation with a free
+    slot elsewhere ("its own slot is decoding"), and let a conversation re-enter a slot holding somebody else's
+    chain.  Both poisons came from one line: an unnamed request took a slot and the ledger kept the previous owner."""
+
+    def test_an_admission_always_rewrites_the_ledger(self):
+        e = engine(2, protect=120.0)
+        for session in (None, "conv-a", "conv-b"):
+            with self.subTest(session=session):
+                e.slot_owner[0] = "stale-conv"
+                e._note_owner(0, session)
+                self.assertEqual(e.slot_owner[0], session or None,
+                                 "an admission left the previous owner on the ledger")
+
+    def test_the_ledger_is_frozen_with_the_window_off(self):
+        e = engine(2)
+        e.slot_owner[0] = "conv-a"
+        e._note_owner(0, "conv-b")
+        e._note_owner(1, None)
+        self.assertEqual(e.slot_owner[0], "conv-a")
+        self.assertIsNone(e.slot_owner[1])
+
+    def test_a_stale_owner_on_a_busy_slot_no_longer_refuses_a_free_conversation(self):
+        """The production poison, end to end: conv-a's window lapsed, an unnamed request took its slot, conv-b now
+        decodes there.  conv-a's next turn used to read the stale ledger, see "my slot is busy", and get refused
+        with a free slot sitting right next to it."""
+        e = engine(2, protect=120.0)
+        e.slot_owner[0] = "conv-a"
+        used_ago(e, 0, 121.0)                       # conv-a's window is gone
+        self.assertEqual(e.pick_slot([1, 2, 3], None), 0)
+        e._note_owner(0, None)                      # the unnamed admission wipes the stale name
+        e.slot_owner[0] = "conv-b"                  # conv-b takes the slot and decodes
+        e.slot_busy[0] = True
+        e.slot_held[1] = [9, 9, 9]
+        self.assertEqual(e.pick_slot([1, 2, 3], "conv-a"), 1,
+                         "conv-a was refused while slot 1 was free: the stale ledger said slot 0 was 'its own'")
+
+    def test_a_reclaimed_slot_cannot_steal_another_conversations_chain(self):
+        """The other poison: conv-a's name stayed on the ledger after a stranger overwrote the chain, so conv-a's
+        next turn walked back into a slot now holding conv-b's cache and destroyed it.  After the wipe conv-b is
+        routed by its own name instead."""
+        e = engine(2, protect=120.0)
+        e.slot_owner[0] = "conv-a"
+        used_ago(e, 0, 121.0)
+        self.assertEqual(e.pick_slot([1, 2, 3], None), 0)
+        e._note_owner(0, None)
+        e.slot_owner[0] = "conv-b"                  # conv-b's admission, its chain now in slot 0
+        e.slot_held[0] = list(range(700, 800))
+        self.assertEqual(e.pick_slot(list(range(700, 810)), "conv-b"), 0)
+        self.assertEqual(e.pick_slot([1, 2, 3], "conv-a"), 1,
+                         "conv-a walked back into the slot conv-b's chain now lives in")
+
 
 class RejectWhenFull(unittest.TestCase):
     def test_absent_is_the_queue_as_it_was(self):

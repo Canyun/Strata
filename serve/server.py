@@ -2172,13 +2172,18 @@ class StrataEngine:
         return zones[slot] if zones and slot < len(zones) else "public"
 
     def _note_owner(self, slot: int, session: str | None) -> None:
-        """The admission takes the slot for the conversation that named itself.  The owner is not cleared at BDONE:
-        the slot stays that conversation's for the window, which is what brings its next turn back to the chain in
-        it.  A request that names no conversation owns nothing: its slot is the one the plain pick gives it, as
-        before."""
+        """The admission takes the slot for whoever named it: the ledger always rewrites to the request that took
+        the slot - a name, or nobody.  The owner is not cleared at BDONE (the slot stays that conversation's for
+        the window, which is what brings its next turn back to the chain in it), but a stranger who takes the slot
+        past the window MUST wipe the stale name: the pick routes by this ledger, and a name on a slot holding
+        somebody else's chain makes "my own slot" / "my own free slot" lie twice at once - a conversation gets
+        refused with a free slot elsewhere, and its next turn can walk into a stranger's cache and destroy it.
+        An unnamed request only ever reaches a slot that is not owned-live (the pick filters those out first), so
+        the wipe cannot erase a live window.  The ledger stays untouched with the window off (the pick ignores it
+        there; there is nothing to keep honest)."""
         owners = getattr(self, "slot_owner", None)
-        if owners is not None and getattr(self, "slot_protect_seconds", 0.0) and session:
-            owners[slot] = session
+        if owners is not None and slot < len(owners) and getattr(self, "slot_protect_seconds", 0.0):
+            owners[slot] = session or None
 
     def pick_slot(self, prompt: list[int], session: str | None = None) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the

@@ -67,6 +67,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/program/split_rules.hpp"
+#include "strata/program/ckpt_save.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
@@ -1446,6 +1447,21 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
     if (strata::core::conversation_checkpoint_save(c, ss, g, error)) return true;
     std::fprintf(stderr, "strata serve: checkpoint save: %s\n", error.c_str());   // the caller's ERR has no reason
     return false;
+}
+
+/// A save wrapped the way #752 wraps the park: the running state's vectors are host memory, and a host that has run
+/// out throws right through the prompt callback - which ended the streaming request.  `shortage` says the copy ran
+/// out of memory; a false without it is a failed copy on a live device, skipped too.  The copy fills complete
+/// vectors, so the checkpoint is the only thing a shortage costs - never the live state.
+bool checkpoint_save_shortage(ConvCheckpoint& c, const strata::core::SessionState& ss,
+                              const strata::core::ModelGeometry& g, bool& shortage) {
+    shortage = false;
+    try {
+        return checkpoint_save(c, ss, g);
+    } catch (const std::bad_alloc&) {
+        shortage = true;   // the caller's throttled line says it
+        return false;
+    }
 }
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
@@ -7854,20 +7870,34 @@ int main(int argc, char **argv) try {
           std::exit(1);
         }
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
-            ckpt_why.clear();
-            if (o.prompt_cache <= 0 || L < 1) return true;
+        // #752's rule for the prompt path: a checkpoint save whose vectors the full host cannot fit is SKIPPED - the
+        // request streams on without it - and only the device itself (gpu_sync_ok) cancels the reader.  The log warns
+        // for the first ten skips and once in every 64 after them, so a full host is visible without one line per
+        // chunk.  The stages' callbacks run on their own threads, so the count is atomic.
+        std::atomic<uint64_t> ckpt_skips{0};
+        auto ckpt_skip = [&](const char* where, bool host_full) {
+            const uint64_t n = ++ckpt_skips;
+            if (strata::program::ckpt_save::warn_this_skip(n, strata::program::ckpt_save::kWarnFirst,
+                                                            strata::program::ckpt_save::kWarnEvery))
+                std::fprintf(stderr, "strata serve: %s skipped: %s (%llu skip(s) since this process started); the "
+                                     "request continues without the checkpoint\n", where,
+                             host_full ? "the host is out of memory" : "the running state's copy failed",
+                             (unsigned long long) n);
+        };
+        // 0: saved (or nothing to do).  1: SKIPPED - the host cannot fit the state, the checkpoint is not written
+        // and the request continues.  2: fatal - the device itself, or a split whose parts cannot form a checkpoint.
+        auto checkpoint_at_body = [&](int64_t L, std::vector<ConvCheckpoint>* parts, bool as_tail) -> int {
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
                     c.used = ++check_clock;
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
-                    return true;
+                    return 0;
                 }
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
             if (parts != nullptr) {
-                if (parts->size() != stages.size() + 1) return false;
+                if (parts->size() != stages.size() + 1) return 2;
                 c.gdn = std::move((*parts)[0].gdn);
                 c.ple = std::move((*parts)[0].ple);
                 c.tails = std::move((*parts)[0].tails);
@@ -7875,12 +7905,14 @@ int main(int argc, char **argv) try {
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else {
-                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
+                if (!gpu_sync_ok()) return 2;   // the device itself
+                if (!checkpoint_save(c, ss, g)) return 1;   // a failed copy on a live device: skip, keep the request
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
                     part.ids = c.ids;
-                    if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g)) return false;
+                    if (!gpu_sync_ok()) return 2;
+                    if (!checkpoint_save(part, st->ss, g)) return 1;
                     c.stage_parts.push_back(std::move(part));
                 }
             }
@@ -7910,7 +7942,32 @@ int main(int argc, char **argv) try {
                     stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get());
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
-            return true;
+            return 0;
+        };
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr,
+                                 bool as_tail = false) -> int {
+            ckpt_why.clear();
+            if (o.prompt_cache <= 0 || L < 1) return 0;
+            // A host that cannot fit the state's vectors throws from the vectors' resize, from the checkpoint list's
+            // push_back, or from an eviction.  The classification draws the line: a shortage is a skip, the device a
+            // stop - #752's rule for parking, applied to the prompt path.  A throw lands here only after the body's
+            // device sync passed (the sync's own failure answers 2, not a throw), so the host is the reader.
+            int outcome = 0;
+            bool allocation_failed = false, device_responding = true;
+            try {
+                outcome = checkpoint_at_body(L, parts, as_tail);
+                device_responding = outcome != 2;   // the body's fatal answer is the device itself
+            } catch (const std::bad_alloc&) {
+                outcome = 1;                        // the host; the classification below decides
+                allocation_failed = true;
+            }
+            if (outcome == 0) return 0;
+            if (strata::program::ckpt_save::classify(allocation_failed, device_responding) ==
+                strata::program::ckpt_save::Action::kSkip) {
+                ckpt_skip("a conversation checkpoint", allocation_failed);
+                return 1;
+            }
+            return 2;
         };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
@@ -7937,7 +7994,7 @@ int main(int argc, char **argv) try {
                 !multi_gpu && !pp_tail_saved && pp_total - done > std::max<int64_t>(1, o.short_read) &&
                 pp_total - done <= T;   // this chunk's real size (--prefill auto chunks differ from o.prefill_chunk)
             if (periodic_checkpoint || tail_checkpoint) {
-                bool saved = false;
+                int ckpt = 0;   // 2 only when the device itself failed
                 if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk
                     std::vector<ConvCheckpoint> parts;
                     {
@@ -7948,11 +8005,13 @@ int main(int argc, char **argv) try {
                     }
                     bool complete = parts.size() == stages.size() + 1;
                     for (const ConvCheckpoint& k : parts) complete = complete && !k.gdn.empty();
-                    saved = !complete || checkpoint_at(done, &parts);   // an incomplete set: no checkpoint here
+                    // an incomplete set (a stage's part the host could not save): no checkpoint at this position
+                    if (complete) ckpt = checkpoint_at(done, &parts);
                 } else {
-                    saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
+                    ckpt = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
                 }
-                if (!saved) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
+                // A checkpoint is an optimization, never a reason to end a request: only the device itself is.
+                if (ckpt == 2) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
                 if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
                 if (tail_checkpoint) pp_tail_saved = true;
             }
@@ -7965,11 +8024,26 @@ int main(int argc, char **argv) try {
                 strata::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
                 strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
+                    (void) e;   // a failed part is a skip now, not the request's error
                     if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
                     part_next[i] = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
-                    part.ids.assign(cur.begin(), cur.begin() + done);
-                    if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
+                    bool shortage = true;   // the ids' copy throwing is the host full, the same as a save's
+                    bool ok = false;
+                    try {
+                        part.ids.assign(cur.begin(), cur.begin() + done);
+                        ok = checkpoint_save_shortage(part, stage_ss, g, shortage);
+                    } catch (const std::bad_alloc&) {
+                        ok = false;
+                        shortage = true;
+                    }
+                    // "saving a checkpoint part failed" used to cancel the request, and the server showed it as
+                    // "LLM streaming error".  The parts' set stays incomplete, so no checkpoint lands at this
+                    // position and the prompt reads on: a part is never half-saved and the live state is untouched.
+                    if (!ok) {
+                        ckpt_skip("a layer split's checkpoint part", shortage);
+                        return true;
+                    }
                     std::lock_guard<std::mutex> lk(part_mu);
                     auto& v = part_at[done];
                     v.resize(stages.size() + 1);
@@ -9055,6 +9129,12 @@ int main(int argc, char **argv) try {
                     << ", line:" << __LINE__ << std::endl;
           std::exit(1);
         }
+        catch (const std::bad_alloc&) {
+          // #752's rule: a host that cannot fit the state's vectors fails the COPY, and the caller marks the slot
+          // un-cached and serves the request on - it is never a reason to end the process.
+          e = "batch slot copy: the host is out of memory";
+          return false;
+        }
         };
         // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
@@ -9124,6 +9204,11 @@ int main(int argc, char **argv) try {
           std::cerr << exc.what() << "Exception caught at file:" << __FILE__
                     << ", line:" << __LINE__ << std::endl;
           std::exit(1);
+        }
+        catch (const std::bad_alloc&) {
+          // the same rule: a host shortage fails the restore, and the caller reads this prompt from token 0
+          e = "batch slot restore: the host is out of memory";
+          return false;
         }
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
@@ -10682,10 +10767,15 @@ int main(int argc, char **argv) try {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at || to == message_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at)) {   // the tail kind leaves first
-                    std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
-                    return 1;
+                if (to == turn_at || to == root_at || to == message_at) {
+                    // the tail kind leaves first; a skipped checkpoint costs the next branch its restart point,
+                    // never this request - only the device itself ends it
+                    const int ckpt = checkpoint_at(to, nullptr,
+                                                   to == message_at && to != turn_at && to != root_at);
+                    if (ckpt == 2) {
+                        std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
                 }
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",

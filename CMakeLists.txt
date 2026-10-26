@@ -309,6 +309,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(prefill_plan_test PRIVATE include)
   add_test(NAME prefill_plan_test COMMAND prefill_plan_test)
 
+  # a failed conversation checkpoint must not end a streaming request (the "saving a checkpoint part failed" bug):
+  # host memory pressure skips the checkpoint, a dead device stays fatal, the skips stay loud then quiet (header-only)
+  add_executable(ckpt_save_test tests/program/ckpt_save_test.cpp)
+  target_include_directories(ckpt_save_test PRIVATE include)
+  add_test(NAME ckpt_save_test COMMAND ckpt_save_test)
+
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)

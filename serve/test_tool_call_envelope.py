@@ -82,20 +82,22 @@ class DriftedEnvelope(unittest.TestCase):
 
 
 class OnlyDeclaredTools(unittest.TestCase):
-    def test_a_call_for_another_tool_stays_text(self):
+    def test_a_call_for_an_undeclared_tool_goes_through(self):
+        """An undeclared name becomes a real tool_call: the client answers it (usually "unknown tool") and
+        the model self-heals next turn.  Refusing it as text used to starve that loop (agents saw the turn
+        end with text only, the model still waiting for a result)."""
         raw = body("<function=get_indicators>", "symbol", "600076")
         for width in (0, 1, 3, 9):
             with self.subTest(width=width):
                 evs, p = run("I will check.\n" + raw, width, tools=TOOLS)
-                self.assertEqual(calls(evs), [])
-                self.assertFalse([e for e in evs if e.kind in ("tool_start", "tool_args")])
-                self.assertEqual(text(evs), "I will check.\n" + raw)
+                self.assertEqual(text(evs), "I will check.")
+                # no schema: parse_tool_call's JSON heuristic decodes numeric-looking values
+                self.assertEqual(calls(evs), [("get_indicators", {"symbol": 600076})])
 
     def test_a_declared_call_after_an_undeclared_one_is_still_a_call(self):
         raw = body("<function=get_indicators>") + "\n" + body("<function=shell>", "cmd", "ls")
         evs, p = run(raw, 5, tools=TOOLS)
-        self.assertEqual(calls(evs), [("shell", {"cmd": "ls"})])
-        self.assertIn("get_indicators", text(evs))
+        self.assertEqual(calls(evs), [("get_indicators", {"input": "1+1"}), ("shell", {"cmd": "ls"})])
 
     def test_the_responses_spelling_of_a_namespace_tool_counts(self):
         evs, p = run(body("<function=ns__web_search>", "q", "x"), 4, tools=TOOLS)

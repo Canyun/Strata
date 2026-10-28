@@ -669,7 +669,7 @@ class ToolCall:
 
 @dataclass
 class Event:
-    kind: str                     # "reasoning" | "content" | "tool_call"
+    kind: str                     # "reasoning" | "content" | "tool_call" | "tool_declined"
     text: str = ""
     call: ToolCall | None = None
 
@@ -1405,8 +1405,13 @@ class OutputParser:
                         out.append(Event("content", self._track(self.buf[:j])))
                         self.buf = self.buf[j:]
                     return out
-                if self.schemas or self.declared_only:
-                    # #3075: a call counts only for a declared tool; the name must be complete to tell
+                if not self.schemas and self.declared_only:
+                    # #3075: a request that declared no tools (Codex compaction keeps them in the prompt only)
+                    # treats every call-shaped block as text.  With tools declared the undeclared name goes
+                    # through as a tool_call event instead: the client answers it (usually "unknown tool"),
+                    # which the model self-heals from next turn.  Refusing it silently as content used to
+                    # starve that loop: the model kept waiting for a result that never came, and agents saw
+                    # the turn end with text only (no tool frame at all).
                     gt = after.find(">")
                     nl = after.find("\n")
                     if gt < 0 and nl < 0:
@@ -1417,10 +1422,9 @@ class OutputParser:
                             out.append(Event("content", self._track(self.buf[:j])))
                             self.buf = self.buf[j:]
                         return out
-                    if gt >= 0 and (nl < 0 or gt < nl) and not self._callable(after[len(FUNC_START):gt].strip()):
-                        out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
-                        self.buf = self.buf[i + len(CALL_START):]
-                        continue
+                    out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
+                    self.buf = self.buf[i + len(CALL_START):]
+                    continue
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
